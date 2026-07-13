@@ -47,6 +47,7 @@ import {
 
 const RUNTIME_KEY = Symbol.for(`${PACKAGE_NAME}/runtime`);
 const WIDGET_KEY = PACKAGE_NAME;
+const PARENT_HERDR_SOURCE = `${PACKAGE_NAME}:parent`;
 const STATE_ROOT = join(getAgentDir(), PACKAGE_NAME);
 const CURSOR_CONFIG_PATH = join(homedir(), ".cursor", "cli-config.json");
 const MAX_SUBAGENTS = 8;
@@ -93,6 +94,9 @@ interface RuntimeState {
 	prerequisitesChecked: boolean;
 	configQueue: Promise<void>;
 	uiQueue: Promise<void>;
+	parentHerdrQueue: Promise<void>;
+	parentHerdrWorking: boolean;
+	parentHerdrSeq: number;
 }
 
 const runtime: RuntimeState =
@@ -102,9 +106,15 @@ const runtime: RuntimeState =
 		prerequisitesChecked: false,
 		configQueue: Promise.resolve(),
 		uiQueue: Promise.resolve(),
+		parentHerdrQueue: Promise.resolve(),
+		parentHerdrWorking: false,
+		parentHerdrSeq: Date.now() * 1000,
 	});
 
 if (!runtime.uiQueue) runtime.uiQueue = Promise.resolve();
+if (!runtime.parentHerdrQueue) runtime.parentHerdrQueue = Promise.resolve();
+if (runtime.parentHerdrWorking === undefined) runtime.parentHerdrWorking = false;
+if (!runtime.parentHerdrSeq) runtime.parentHerdrSeq = Date.now() * 1000;
 
 if (runtime.widgetTimer) {
 	clearInterval(runtime.widgetTimer);
@@ -430,6 +440,44 @@ function setActivity(agent: ManagedSubagent, status: ManagedStatus, activity: st
 	scheduleWidgetUpdate();
 }
 
+export function hasWorkingSubagents(
+	agents: Iterable<{ pending: boolean; status: ManagedStatus }>,
+): boolean {
+	return Array.from(agents).some(
+		(agent) => agent.pending || agent.status === "starting" || agent.status === "working",
+	);
+}
+
+/** Keep the parent Pi pane working while asynchronous subagent turns are outstanding. */
+function syncParentHerdrState(): void {
+	const paneId = process.env.HERDR_PANE_ID;
+	if (!runtime.pi || !paneId || process.env.HERDR_ENV !== "1") return;
+
+	const working = hasWorkingSubagents(runtime.agents.values());
+	if (working === runtime.parentHerdrWorking) return;
+	runtime.parentHerdrWorking = working;
+	const seq = ++runtime.parentHerdrSeq;
+	const args = working
+		? [
+				"pane", "report-agent", paneId,
+				"--source", PARENT_HERDR_SOURCE,
+				"--agent", "pi",
+				"--state", "working",
+				"--message", "Cursor subagent working",
+				"--seq", String(seq),
+			]
+		: [
+				"pane", "release-agent", paneId,
+				"--source", PARENT_HERDR_SOURCE,
+				"--agent", "pi",
+				"--seq", String(seq),
+			];
+
+	runtime.parentHerdrQueue = runtime.parentHerdrQueue
+		.then(() => execHerdr(args).then(() => undefined))
+		.catch(() => undefined);
+}
+
 export function contentText(content: unknown): string {
 	if (!content || typeof content !== "object") return "";
 	const value = content as { type?: unknown; text?: unknown };
@@ -723,6 +771,7 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 	agent.currentOutput = "";
 	writeLog(agent, "user", prompt);
 	setActivity(agent, "working", "starting turn");
+	syncParentHerdrState();
 
 	agent.client
 		.prompt(prompt)
@@ -732,6 +781,7 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 			agent.pending = false;
 			writeLog(agent, "turn", `completed${result.stopReason ? ` — ${result.stopReason}` : ""}`);
 			setActivity(agent, "ready", "ready for follow-up");
+			syncParentHerdrState();
 			deliverResult(agent, result.stopReason);
 			scheduleIdleClose(agent);
 		})
@@ -741,6 +791,7 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 			agent.pending = false;
 			writeLog(agent, "error", error?.message ?? String(error));
 			setActivity(agent, "failed", "failed");
+			syncParentHerdrState();
 			deliverFailure(agent, error);
 		});
 }
@@ -839,6 +890,7 @@ async function spawnSubagent(
 			agent.pending = false;
 			writeLog(agent, "process", `exited (${code ?? signal ?? "unknown"})`);
 			setActivity(agent, "failed", "ACP process exited");
+			syncParentHerdrState();
 			deliverFailure(agent, new Error(`Cursor ACP process exited (${code ?? signal ?? "unknown"}).`));
 		},
 	});
@@ -893,6 +945,7 @@ async function stopSubagent(agent: ManagedSubagent, reason = "stopped by parent"
 	agent.status = "stopped";
 	agent.activity = "stopped";
 	runtime.agents.delete(agent.id);
+	syncParentHerdrState();
 	endLogStream(agent);
 	writeLog(agent, "session", reason);
 	await Promise.allSettled([agent.client.close(), closeViewer(agent)]);

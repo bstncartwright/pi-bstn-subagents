@@ -7,12 +7,22 @@ import {
 	appendBounded,
 	contentText,
 	formatElapsed,
+	hasWorkingSubagents,
 	parseJson,
 	shellQuote,
 	summarize,
 	toolLabel,
 	SUBAGENT_IDLE_TIMEOUT_MS,
 } from "../extensions/index.ts";
+
+test("parent Pi stays working only while subagent turns are outstanding", () => {
+	assert.equal(hasWorkingSubagents([]), false);
+	assert.equal(hasWorkingSubagents([{ pending: false, status: "ready" }]), false);
+	assert.equal(hasWorkingSubagents([{ pending: true, status: "ready" }]), true);
+	assert.equal(hasWorkingSubagents([{ pending: false, status: "starting" }]), true);
+	assert.equal(hasWorkingSubagents([{ pending: false, status: "working" }]), true);
+	assert.equal(hasWorkingSubagents([{ pending: false, status: "failed" }]), false);
+});
 
 test("ready subagents use a 15-minute idle timeout", async () => {
 	assert.equal(SUBAGENT_IDLE_TIMEOUT_MS, 15 * 60 * 1000);
@@ -39,11 +49,10 @@ test("appendBounded keeps the trailing window", () => {
 	assert.equal(appendBounded("hello", "WORLD", 8), "lloWORLD");
 });
 
-test("extension uses plain viewer tabs without Herdr agent identity", async () => {
+test("extension uses plain viewer tabs without assigning them Herdr agent identity", async () => {
 	const { readFileSync } = await import("node:fs");
 	const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf8");
-	assert.doesNotMatch(source, /report-agent/);
-	assert.doesNotMatch(source, /release-agent/);
+	assert.match(source, /PARENT_HERDR_SOURCE/);
 	assert.doesNotMatch(source, /report-metadata/);
 	assert.doesNotMatch(source, /--display-agent/);
 	assert.match(source, /"--label"/);
