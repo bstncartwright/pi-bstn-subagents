@@ -7,8 +7,6 @@ import {
 	appendBounded,
 	contentText,
 	formatElapsed,
-	herdrSource,
-	herdrState,
 	parseJson,
 	shellQuote,
 	summarize,
@@ -32,13 +30,15 @@ test("appendBounded keeps the trailing window", () => {
 	assert.equal(appendBounded("hello", "WORLD", 8), "lloWORLD");
 });
 
-test("herdrSource and herdrState map managed status for Herdr reporting", () => {
-	assert.equal(herdrSource("abc123"), "pi:cursor-acp:abc123");
-	assert.equal(herdrState("ready"), "idle");
-	assert.equal(herdrState("failed"), "blocked");
-	assert.equal(herdrState("starting"), "working");
-	assert.equal(herdrState("working"), "working");
-	assert.equal(herdrState("stopped"), "unknown");
+test("extension uses plain viewer tabs without Herdr agent identity", async () => {
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /report-agent/);
+	assert.doesNotMatch(source, /release-agent/);
+	assert.doesNotMatch(source, /report-metadata/);
+	assert.doesNotMatch(source, /--display-agent/);
+	assert.match(source, /"--label"/);
+	assert.match(source, /tail -n 200 -F/);
 });
 
 test("contentText and toolLabel extract ACP update fields", () => {

@@ -2,7 +2,7 @@
 
 A [Pi](https://pi.dev) package that manages interactive [Cursor](https://cursor.com) agents over ACP, with each subagent visualized in a dedicated background [Herdr](https://herdr.dev) event-viewer tab.
 
-Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer. When a turn ends, the result is steered back into Pi and the ACP session stays open for follow-ups.
+Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi and the ACP session stays open for follow-ups.
 
 ## Prerequisites
 
@@ -13,22 +13,22 @@ Spawn and follow-up return immediately after submission. Structured ACP thoughts
 
 ## Install
 
-Pinned v0.1.0 from Git:
+Pinned v0.1.1 from Git:
 
 ```bash
-pi install git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.0
+pi install git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
 ```
 
 Project-local:
 
 ```bash
-pi install -l git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.0
+pi install -l git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
 ```
 
 Try for one run without installing:
 
 ```bash
-pi -e git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.0
+pi -e git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
 ```
 
 From a local checkout:
@@ -44,6 +44,8 @@ If Pi is already running, reload with `/reload`.
 ### Migration from the old local extension
 
 If you previously used the auto-discovered copy at `~/.pi/agent/extensions/cursor-herdr-subagents/`, **remove that directory** (or move it aside) before relying on this package. Otherwise Pi can load both the old auto-allowing extension and this package, and behavior will be confusing or unsafe. After removal, install the package above and `/reload`.
+
+When upgrading from `v0.1.0`, stop existing subagents and restart Pi once. The old runtime registered those viewer panes as Herdr agents; a full restart clears that legacy state before `v0.1.1` creates viewer-only tabs.
 
 ## Usage
 
@@ -94,7 +96,7 @@ Logs intentionally omit raw tool inputs and redact permission payloads to title/
 
 ## Security
 
-Pi packages run with your **full system permissions**. There is **no sandbox**: this extension spawns Cursor ACP in the requested working directory and can create/control Herdr tabs in the current workspace.
+Pi packages run with your **full system permissions**. There is **no sandbox**: this extension spawns Cursor ACP in the requested working directory and can create/control Herdr viewer tabs (named with `tab create --label` only; no agent registration or badge metadata) in the current workspace.
 
 Additional notes:
 

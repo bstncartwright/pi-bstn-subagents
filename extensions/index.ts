@@ -80,7 +80,6 @@ interface ManagedSubagent {
 	lastError?: string;
 	todos: Array<{ id?: string; content?: string; status?: string }>;
 	streamLabel?: "thought" | "assistant";
-	reportSeq: number;
 }
 
 interface RuntimeState {
@@ -423,56 +422,9 @@ function boundedOutput(output: string): { text: string; truncated: boolean } {
 	};
 }
 
-export function herdrSource(agentId: string): string {
-	return `pi:cursor-acp:${agentId}`;
-}
-
-export function herdrState(status: ManagedStatus): "idle" | "working" | "blocked" | "unknown" {
-	if (status === "ready") return "idle";
-	if (status === "failed") return "blocked";
-	if (status === "starting" || status === "working") return "working";
-	return "unknown";
-}
-
-function reportHerdrState(agent: ManagedSubagent): void {
-	if (!runtime.pi || agent.closing) return;
-	agent.reportSeq += 1;
-	void execHerdr([
-		"pane",
-		"report-agent",
-		agent.viewerPaneId,
-		"--source",
-		herdrSource(agent.id),
-		"--agent",
-		"cursor",
-		"--state",
-		herdrState(agent.status),
-		"--message",
-		agent.activity,
-		"--seq",
-		String(agent.reportSeq),
-	]).catch(() => undefined);
-}
-
-async function releaseHerdrState(agent: ManagedSubagent): Promise<void> {
-	agent.reportSeq += 1;
-	await execHerdr([
-		"pane",
-		"release-agent",
-		agent.viewerPaneId,
-		"--source",
-		herdrSource(agent.id),
-		"--agent",
-		"cursor",
-		"--seq",
-		String(agent.reportSeq),
-	]).catch(() => undefined);
-}
-
 function setActivity(agent: ManagedSubagent, status: ManagedStatus, activity: string): void {
 	agent.status = status;
 	agent.activity = activity;
-	reportHerdrState(agent);
 	scheduleWidgetUpdate();
 }
 
@@ -803,22 +755,10 @@ async function createViewer(name: string, cwd: string, logPath: string): Promise
 	if (!paneId || !tabId) throw new Error("Herdr did not return a pane and tab for the Cursor viewer.");
 
 	await execHerdr(["pane", "run", paneId, `tail -n 200 -F ${shellQuote(logPath)}`]);
-	await execHerdr([
-		"pane",
-		"report-metadata",
-		paneId,
-		"--source",
-		`pi:cursor-acp-viewer:${paneId}`,
-		"--display-agent",
-		"Cursor ACP",
-		"--title",
-		name,
-	]).catch(() => undefined);
 	return { paneId, tabId, workspaceId };
 }
 
 async function closeViewer(agent: ManagedSubagent): Promise<void> {
-	await releaseHerdrState(agent);
 	const tab = await exec("herdr", ["tab", "close", agent.viewerTabId], 5000);
 	if (tab.code === 0) return;
 	await exec("herdr", ["pane", "close", agent.viewerPaneId], 5000).catch(() => undefined);
@@ -904,10 +844,8 @@ async function spawnSubagent(
 		currentThought: "",
 		currentOutput: "",
 		todos: [],
-		reportSeq: Date.now() * 1000,
 	};
 	runtime.agents.set(id, agent);
-	reportHerdrState(agent);
 	startWidgetTimer();
 	updateWidget();
 

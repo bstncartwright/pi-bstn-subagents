@@ -45,5 +45,6 @@ test("ACP clientInfo version matches package.json", () => {
 	const acpSource = readFileSync(new URL("../extensions/acp.ts", import.meta.url), "utf8");
 	assert.match(acpSource, /PACKAGE_NAME/);
 	assert.match(acpSource, /PACKAGE_VERSION/);
-	assert.doesNotMatch(acpSource, /version:\s*"0\.1\.0"/);
+	assert.doesNotMatch(acpSource, /version:\s*"0\.1\.\d+"/);
+	assert.equal(pkg.version, "0.1.1");
 });
