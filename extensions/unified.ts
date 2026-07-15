@@ -15,7 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -427,8 +427,50 @@ export class JsonlDecoder {
 	}
 }
 
+function resolveExecutable(name: string, override?: string): string {
+	if (override?.trim()) return override.trim();
+	const candidates = [
+		...(process.env.PATH ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, name)),
+		join(homedir(), ".local", "bin", name),
+	];
+	return candidates.find((candidate) => existsSync(candidate)) ?? name;
+}
+
+interface CommandResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+	killed: boolean;
+}
+
+function runCommand(command: string, args: string[], cwd: string, timeoutMs = 5000): Promise<CommandResult> {
+	return new Promise((done) => {
+		const child = spawn(command, args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		let killed = false;
+		let settled = false;
+		const finish = (code: number) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			done({ stdout, stderr, code, killed });
+		};
+		child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+		child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+		child.on("error", (error) => { stderr += error.message; finish(1); });
+		child.on("exit", (code) => finish(code ?? 0));
+		const timer = setTimeout(() => {
+			killed = true;
+			child.kill("SIGTERM");
+			finish(1);
+		}, timeoutMs);
+		timer.unref?.();
+	});
+}
+
 function piInvocation(): { command: string; prefix: string[] } {
-	if (process.env.PI_SUBAGENT_PI_BIN) return { command: process.env.PI_SUBAGENT_PI_BIN, prefix: [] };
+	if (process.env.PI_SUBAGENT_PI_BIN) return { command: resolveExecutable("pi", process.env.PI_SUBAGENT_PI_BIN), prefix: [] };
 	const entry = process.argv[1];
 	if (entry && existsSync(entry)) return { command: process.execPath, prefix: [entry] };
 	return { command: "pi", prefix: [] };
@@ -628,7 +670,9 @@ class UnifiedManager {
 	}
 
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<AgentInfo> {
-		await this.ensurePrerequisites(params.backend);
+		const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
+		if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
+		await this.ensurePrerequisites(params.backend, cwd);
 		const parentSessionId = this.parentSessionId(ctx);
 		if (readScope(parentSessionId).filter((info) => info.status !== "closed").length >= MAX_AGENTS) {
 			throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
@@ -639,8 +683,6 @@ class UnifiedManager {
 		if (template?.backend && template.backend !== params.backend) {
 			throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
 		}
-		const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
-		if (!statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
 		const dir = scopeDir(parentSessionId);
 		ensureDir(dir);
 		const lockPath = join(dir, `.task-${taskStorageKey(taskName)}.lock`);
@@ -899,34 +941,34 @@ class UnifiedManager {
 		timer.unref?.();
 	}
 
-	private async ensurePrerequisites(backend: AgentBackend): Promise<void> {
+	private async ensurePrerequisites(backend: AgentBackend, cwd: string): Promise<void> {
 		if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) {
 			throw new Error("Subagents require Pi to run inside a Herdr workspace.");
 		}
-		const commands: Array<[string, string[]]> = [["herdr", ["--version"]]];
-		if (backend === "cursor") commands.push(["agent", ["--version"]]);
+		const commands: Array<[string, string[]]> = [[resolveExecutable("herdr", process.env.HERDR_BIN), ["--version"]]];
+		if (backend === "cursor") commands.push([resolveExecutable("agent", process.env.CURSOR_AGENT_BIN), ["--version"]]);
 		else commands.push([piInvocation().command, ["--version"]]);
 		for (const [command, args] of commands) {
-			const result = await this.pi.exec(command, args, { timeout: 5000 });
+			const result = await runCommand(command, args, cwd, 5000);
 			if (result.code !== 0) throw new Error((result.stderr || `${command} is unavailable`).trim());
 		}
 	}
 
 	private async createViewer(info: AgentInfo): Promise<{ paneId: string; tabId: string }> {
-		const result = await this.pi.exec("herdr", [
+		const result = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), [
 			"tab", "create",
 			"--workspace", process.env.HERDR_WORKSPACE_ID!,
 			"--cwd", info.cwd,
 			"--label", `${info.taskName} [${info.backend}]`,
 			"--no-focus",
-		], { timeout: 5000 });
+		], info.cwd, 5000);
 		if (result.code !== 0) throw new Error((result.stderr || result.stdout || "herdr tab create failed").trim());
 		let parsed: any;
 		try { parsed = JSON.parse(result.stdout); } catch { throw new Error(`Unexpected Herdr output: ${result.stdout.trim()}`); }
 		const paneId = parsed.result?.root_pane?.pane_id;
 		const tabId = parsed.result?.tab?.tab_id ?? parsed.result?.root_pane?.tab_id;
 		if (!paneId || !tabId) throw new Error("Herdr did not return viewer pane/tab ids.");
-		const tail = await this.pi.exec("herdr", ["pane", "run", paneId, `tail -n 200 -F '${info.logFile.replace(/'/g, `'\\''`)}'`], { timeout: 5000 });
+		const tail = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "run", paneId, `tail -n 200 -F '${info.logFile.replace(/'/g, `'\\''`)}'`], info.cwd, 5000);
 		if (tail.code !== 0) throw new Error((tail.stderr || "Could not start Herdr viewer").trim());
 		return { paneId, tabId };
 	}
@@ -938,10 +980,10 @@ class UnifiedManager {
 		delete info.viewerPaneId;
 		saveInfo(info);
 		if (tabId) {
-			const result = await this.pi.exec("herdr", ["tab", "close", tabId], { timeout: 5000 });
+			const result = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), ["tab", "close", tabId], info.cwd, 5000);
 			if (result.code === 0) return;
 		}
-		if (paneId) await this.pi.exec("herdr", ["pane", "close", paneId], { timeout: 5000 });
+		if (paneId) await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "close", paneId], info.cwd, 5000);
 	}
 
 	private async startRuntime(info: AgentInfo): Promise<RuntimeHandle> {
@@ -1267,7 +1309,7 @@ class UnifiedManager {
 			? ["pane", "report-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--state", "working", "--message", "Subagent working", "--seq", String(seq)]
 			: ["pane", "release-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--seq", String(seq)];
 		this.parentQueue = this.parentQueue.then(async () => {
-			await this.pi.exec("herdr", args, { timeout: 5000 });
+			await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), args, this.ctx?.cwd ?? process.cwd(), 5000);
 		}).catch(() => undefined);
 	}
 }
