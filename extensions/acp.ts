@@ -8,7 +8,45 @@ const pkg = require("../package.json") as { name: string; version: string };
 export const PACKAGE_NAME = pkg.name;
 export const PACKAGE_VERSION = pkg.version;
 
-export type CursorModel = "Auto" | "Grok 4.5 High";
+export const CURSOR_MODEL_IDS = ["Auto", "Grok 4.5 High"] as const;
+
+export type CursorModel = (typeof CURSOR_MODEL_IDS)[number];
+
+export interface CursorModelPreset {
+	displayName: string;
+	fixedThinkingLevel: null | "high";
+	configurationLabel: string;
+	verifyApplied: boolean;
+	config: readonly { id: string; value: string }[];
+}
+
+/** Static Cursor ACP choices and their complete session configuration. */
+export const CURSOR_MODEL_PRESETS = {
+	Auto: {
+		displayName: "Auto",
+		fixedThinkingLevel: null,
+		configurationLabel: "Auto",
+		verifyApplied: false,
+		config: [{ id: "model", value: "default" }],
+	},
+	"Grok 4.5 High": {
+		displayName: "Grok 4.5 High",
+		fixedThinkingLevel: "high",
+		configurationLabel: "non-fast Grok High",
+		verifyApplied: true,
+		config: [
+			{ id: "model", value: "grok-4.5" },
+			{ id: "effort", value: "high" },
+			{ id: "fast", value: "false" },
+		],
+	},
+} as const satisfies Record<CursorModel, CursorModelPreset>;
+
+export const DEFAULT_CURSOR_MODEL: CursorModel = CURSOR_MODEL_IDS[0];
+
+export function isCursorModel(value: unknown): value is CursorModel {
+	return typeof value === "string" && CURSOR_MODEL_IDS.some((id) => id === value);
+}
 
 export interface JsonRpcMessage {
 	jsonrpc?: string;
@@ -168,20 +206,19 @@ export class CursorAcpClient {
 		this.sessionId = sessionId;
 
 		let configOptions = created?.configOptions ?? [];
-		if (model === "Auto") {
-			configOptions = await this.setConfig("model", "default");
-		} else {
-			configOptions = await this.setConfig("model", "grok-4.5");
-			configOptions = await this.setConfig("effort", "high");
-			configOptions = await this.setConfig("fast", "false");
+		const preset = CURSOR_MODEL_PRESETS[model];
+		for (const option of preset.config) {
+			configOptions = await this.setConfig(option.id, option.value);
+		}
 
-			const selectedModel = findConfig(configOptions, "model")?.currentValue;
-			const selectedEffort = findConfig(configOptions, "effort")?.currentValue;
-			const selectedFast = findConfig(configOptions, "fast")?.currentValue;
-			if (selectedModel !== "grok-4.5" || selectedEffort !== "high" || selectedFast !== "false") {
-				throw new Error(
-					`Cursor ACP did not apply non-fast Grok High (model=${selectedModel}, effort=${selectedEffort}, fast=${selectedFast}).`,
-				);
+		if (preset.verifyApplied) {
+			const applied = preset.config.map((option) => ({
+				...option,
+				currentValue: findConfig(configOptions, option.id)?.currentValue,
+			}));
+			if (applied.some((option) => option.currentValue !== option.value)) {
+				const state = applied.map((option) => `${option.id}=${String(option.currentValue)}`).join(", ");
+				throw new Error(`Cursor ACP did not apply ${preset.configurationLabel} (${state}).`);
 			}
 		}
 

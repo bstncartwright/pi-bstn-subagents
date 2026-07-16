@@ -34,7 +34,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { CursorAcpClient, PACKAGE_NAME, type CursorModel, type JsonRpcMessage } from "./acp.ts";
+import {
+	CURSOR_MODEL_IDS,
+	DEFAULT_CURSOR_MODEL,
+	CursorAcpClient,
+	isCursorModel,
+	PACKAGE_NAME,
+	type CursorModel,
+	type JsonRpcMessage,
+} from "./acp.ts";
+import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
 import {
 	ALLOW_ONCE_IDS,
 	cancelledPermissionResult,
@@ -122,6 +131,22 @@ export interface AgentInfo {
 	lastTaskMessage?: string;
 	finalResponse?: string;
 	error?: string;
+}
+
+export function formatElapsed(startedAt: number, now = Date.now()): string {
+	const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+export function formatPersistentWidgetMetadata(
+	info: Pick<AgentInfo, "backend" | "model" | "thinking" | "status" | "createdAt">,
+	now = Date.now(),
+): string {
+	const parts = [`[${info.backend}] ${info.model}`];
+	if (info.backend === "pi") parts.push(`thinking ${info.thinking ?? "unknown"}`);
+	parts.push(info.status, formatElapsed(info.createdAt, now));
+	return parts.join(" · ");
 }
 
 export function compactActivityText(value: string | undefined, maxCodePoints = 120): string {
@@ -218,6 +243,8 @@ interface SpawnParams {
 	agent_type?: string;
 	skills?: string[];
 	cwd?: string;
+	pi_model?: string;
+	pi_thinking?: ThinkingLevel;
 	cursor_model?: CursorModel;
 	permission_mode?: PermissionMode;
 }
@@ -336,12 +363,97 @@ function thinkingLevel(value: unknown): ThinkingLevel | undefined {
 		: undefined;
 }
 
+export type PiModelSelectionSource = "explicit" | "template" | "parent";
+export type PiThinkingSelectionSource = "explicit" | "template" | "parent";
+
+export interface PiSpawnSelection {
+	provider: string;
+	modelId: string;
+	modelSource: PiModelSelectionSource;
+	thinking?: ThinkingLevel;
+	thinkingSource: PiThinkingSelectionSource;
+}
+
+export interface PiSpawnSelectionInput {
+	piModel?: string;
+	piThinking?: ThinkingLevel;
+	template?: Pick<AgentTemplate, "name" | "provider" | "model" | "thinking">;
+	parentModel?: { provider?: string; id?: string };
+	parentThinking?: ThinkingLevel;
+}
+
+export function parsePiModel(value: string): { provider: string; modelId: string } {
+	const trimmed = value.trim();
+	const slash = trimmed.indexOf("/");
+	const provider = slash < 0 ? "" : trimmed.slice(0, slash).trim();
+	const modelId = slash < 0 ? "" : trimmed.slice(slash + 1).trim();
+	if (!provider || !modelId) {
+		throw new Error("pi_model must use exact provider/model-id format with nonempty provider and model id.");
+	}
+	return { provider, modelId };
+}
+
+export function resolvePiSpawnSelection(input: PiSpawnSelectionInput): PiSpawnSelection {
+	let provider: string;
+	let modelId: string;
+	let modelSource: PiModelSelectionSource;
+
+	if (input.piModel !== undefined) {
+		({ provider, modelId } = parsePiModel(input.piModel));
+		modelSource = "explicit";
+	} else {
+		const hasTemplateProvider = input.template?.provider !== undefined;
+		const hasTemplateModel = input.template?.model !== undefined;
+		if (hasTemplateProvider || hasTemplateModel) {
+			provider = input.template?.provider?.trim() ?? "";
+			modelId = input.template?.model?.trim() ?? "";
+			if (!provider || !modelId) {
+				const label = input.template?.name ? ` ${input.template.name}` : "";
+				throw new Error(`Pi template${label} must define both nonempty provider and model values.`);
+			}
+			modelSource = "template";
+		} else {
+			if (!input.parentModel?.provider || !input.parentModel.id) {
+				throw new Error("Pi backend requires an active parent provider/model when no explicit or template model is selected.");
+			}
+			provider = input.parentModel.provider;
+			modelId = input.parentModel.id;
+			modelSource = "parent";
+		}
+	}
+
+	const thinking = input.piThinking ?? input.template?.thinking ?? input.parentThinking;
+	const thinkingSource: PiThinkingSelectionSource = input.piThinking !== undefined
+		? "explicit"
+		: input.template?.thinking !== undefined
+			? "template"
+			: "parent";
+	return { provider, modelId, modelSource, thinking, thinkingSource };
+}
+
+export function validatePiModelSelection(
+	selection: Pick<PiSpawnSelection, "provider" | "modelId" | "modelSource">,
+	findModel: (provider: string, modelId: string) => unknown,
+): void {
+	if (selection.modelSource === "parent") return;
+	if (!findModel(selection.provider, selection.modelId)) {
+		throw new Error(`Pi model not found: ${selection.provider}/${selection.modelId}`);
+	}
+}
+
+export function validateSpawnPiOptions(
+	backend: AgentBackend,
+	options: { pi_model?: string; pi_thinking?: ThinkingLevel },
+): void {
+	if (backend === "cursor" && (options.pi_model !== undefined || options.pi_thinking !== undefined)) {
+		throw new Error("pi_model and pi_thinking are only valid when backend=pi.");
+	}
+}
+
 export function parseAgentTemplateText(text: string, fallbackName: string): AgentTemplate {
 	const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(text);
 	const backend = frontmatter.backend === "pi" || frontmatter.backend === "cursor" ? frontmatter.backend : undefined;
-	const cursorModel = frontmatter.cursor_model === "Auto" || frontmatter.cursor_model === "Grok 4.5 High"
-		? frontmatter.cursor_model
-		: undefined;
+	const cursorModel = isCursorModel(frontmatter.cursor_model) ? frontmatter.cursor_model : undefined;
 	const permissionMode = ["agent", "prompt", "allow-once", "deny"].includes(String(frontmatter.permission_mode))
 		? normalizePermissionMode(frontmatter.permission_mode)
 		: undefined;
@@ -719,18 +831,31 @@ class UnifiedManager {
 	}
 
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<AgentInfo> {
+		validateSpawnPiOptions(params.backend, params);
 		const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
 		if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
-		await this.ensurePrerequisites(params.backend, cwd);
-		const parentSessionId = this.parentSessionId(ctx);
-		if (readScope(parentSessionId).filter((info) => info.status !== "closed").length >= MAX_AGENTS) {
-			throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
-		}
 		const taskName = normalizeTaskName(params.task_name);
 		const template = params.agent_type ? listAgentTemplates().find((entry) => entry.name === params.agent_type) : undefined;
 		if (params.agent_type && !template) throw new Error(`Agent template not found: ${params.agent_type}`);
 		if (template?.backend && template.backend !== params.backend) {
 			throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
+		}
+		const piSelection = params.backend === "pi"
+			? resolvePiSpawnSelection({
+				piModel: params.pi_model,
+				piThinking: params.pi_thinking,
+				template,
+				parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+				parentThinking: this.pi.getThinkingLevel() as ThinkingLevel,
+			})
+			: undefined;
+		if (piSelection) {
+			validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId));
+		}
+		await this.ensurePrerequisites(params.backend, cwd);
+		const parentSessionId = this.parentSessionId(ctx);
+		if (readScope(parentSessionId).filter((info) => info.status !== "closed").length >= MAX_AGENTS) {
+			throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
 		}
 		const dir = scopeDir(parentSessionId);
 		ensureDir(dir);
@@ -748,13 +873,7 @@ class UnifiedManager {
 			const id = randomUUID();
 			const prefix = join(dir, id);
 			const now = Date.now();
-			const currentModel = ctx.model;
-			if (params.backend === "pi" && (!currentModel?.provider || !currentModel?.id)) {
-				throw new Error("Pi backend requires an active parent provider/model.");
-			}
-			const provider = template?.provider && template.model ? template.provider : currentModel?.provider;
-			const modelId = template?.provider && template.model ? template.model : currentModel?.id;
-			const cursorModel = params.cursor_model ?? template?.cursorModel ?? "Auto";
+			const cursorModel = params.cursor_model ?? template?.cursorModel ?? DEFAULT_CURSOR_MODEL;
 			const config = readJson<Config>(CONFIG_PATH) ?? {};
 			const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
 			const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
@@ -776,10 +895,12 @@ class UnifiedManager {
 				parentSessionFile: ctx.sessionManager.getSessionFile?.(),
 				agentType: params.agent_type,
 				cwd,
-				model: params.backend === "pi" ? `${provider}:${modelId}` : cursorModel,
-				provider,
-				modelId,
-				thinking: template?.thinking ?? (this.pi.getThinkingLevel() as ThinkingLevel),
+				model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel,
+				...(piSelection ? {
+					provider: piSelection.provider,
+					modelId: piSelection.modelId,
+					thinking: piSelection.thinking,
+				} : {}),
 				tools: selectedTools,
 				skills: selectedSkills,
 				skillPaths: selectedSkills.map((skill) => resolveSkillPath(skill, cwd)),
@@ -1107,7 +1228,7 @@ class UnifiedManager {
 					onStderr: (text) => log(info, "cursor stderr", text.trimEnd()),
 					onExit: (code, signal) => this.handleRuntimeExit(live, new Error(`Cursor ACP exited (${code ?? signal ?? "unknown"}).`)),
 				});
-				const started = await this.withCursorConfig(() => live.cursor!.start(info.cursorModel ?? "Auto", { sessionId: info.acpSessionId }));
+				const started = await this.withCursorConfig(() => live.cursor!.start(info.cursorModel ?? DEFAULT_CURSOR_MODEL, { sessionId: info.acpSessionId }));
 				info.acpSessionId = started.sessionId;
 				info.acpCapabilities = started.agentCapabilities;
 				log(info, "ACP", `${started.loaded ? "loaded" : "created"} ${started.sessionId}`);
@@ -1519,7 +1640,7 @@ class UnifiedManager {
 				const lines = [theme.fg("accent", theme.bold(`Subagents — ${running} running · ${infos.length - running} settled`))];
 				for (const info of infos) {
 					const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
-					lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", `[${info.backend}] ${info.model} · ${info.status}`)}`);
+					lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", formatPersistentWidgetMetadata(info))}`);
 					lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`));
 				}
 				return lines.map((line) => truncateToWidth(line, width));
@@ -1628,7 +1749,8 @@ function eventText(event: MailEvent, manager: UnifiedManager, parentSessionId: s
 export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 	const manager = new UnifiedManager(pi);
 	const Backend = StringEnum(["pi", "cursor"] as const, { description: "Required runtime backend. Choose explicitly." });
-	const CursorModelSchema = StringEnum(["Auto", "Grok 4.5 High"] as const);
+	const PiThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Explicit Pi thinking level. Invalid for Cursor." });
+	const CursorModelSchema = StringEnum(CURSOR_MODEL_IDS);
 	const PermissionSchema = StringEnum(["agent", "prompt", "allow-once", "deny"] as const);
 	const SpawnSchema = Type.Object({
 		task_name: Type.String({ description: "Session-scoped task name; slash-separated names are allowed." }),
@@ -1637,6 +1759,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 		agent_type: Type.Optional(Type.String({ description: `Optional template from ${AGENTS_DIR}.` })),
 		skills: Type.Optional(Type.Array(Type.String(), { description: "Additional explicit Pi skills. Ignored by Cursor." })),
 		cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to parent cwd." })),
+		pi_model: Type.Optional(Type.String({ description: "Pi model in exact provider/model-id format. Split at the first slash; later slashes and colons remain part of the model id. Invalid for Cursor." })),
+		pi_thinking: Type.Optional(PiThinkingSchema),
 		cursor_model: Type.Optional(CursorModelSchema),
 		permission_mode: Type.Optional(PermissionSchema),
 	});
@@ -1646,11 +1770,14 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		get description() {
-			return `Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Returns after startup; use wait_agent or wait_all_agents for results. Templates can configure backend-specific model, tools, skills, extensions, and prompts.\n\nAvailable templates:\n${templatesDescription()}`;
+			return `Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Returns after startup; use wait_agent or wait_all_agents for results. For Pi, pi_model must be provider/model-id and pi_thinking selects reasoning effort; each independently uses explicit spawn > template > parent precedence. Pi-only fields are rejected for Cursor. Templates can configure backend-specific model, tools, skills, extensions, and prompts.\n\nAvailable templates:\n${templatesDescription()}`;
 		},
 		promptSnippet: "Spawn a session-scoped Pi or Cursor ACP agent; backend must be explicit.",
 		promptGuidelines: [
 			"Always pass backend=pi or backend=cursor explicitly to spawn_agent; never infer a hidden default.",
+			"Before spawn_agent selects a non-inherited model, use list_subagent_models to discover exact backend-specific spawn values and thinking controls.",
+			"For spawn_agent backend=pi, use pi_model in exact provider/model-id format and pi_thinking only when overriding template or parent defaults. Model and thinking each resolve as explicit spawn > template > parent.",
+			"Never pass pi_model or pi_thinking to spawn_agent backend=cursor; use cursor_model instead.",
 			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result must block the current workflow; never sleep or poll.",
 			"When no active wait consumes a subagent completion, it is delivered automatically as a follow-up message. Use the included result directly and do not wait for that completed turn again.",
 			"Cursor ACP permission requests are returned by an active wait or delivered as follow-up messages; answer them with respond_agent_permission and wait again when needed.",
@@ -1673,6 +1800,33 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 		renderResult(result: any, _options: any, theme: any) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ spawn failed" : `✓ ${result.details?.agent_name ?? "spawned"}`), 0, 0); },
 	};
 	pi.registerTool(spawnTool);
+
+	pi.registerTool({
+		name: "list_subagent_models",
+		label: "List Subagent Models",
+		description: "List exact model choices for subagent backends. Pi rows are live models with configured auth; Cursor rows are static presets and do not probe ACP installation or login. Supports substring filtering and bounded pagination.",
+		promptSnippet: "List exact backend-specific subagent model and thinking parameters.",
+		promptGuidelines: [
+			"Use list_subagent_models before spawn_agent whenever selecting a non-inherited model; use the returned spawn_parameter as the field name and model as its exact value.",
+		],
+		parameters: Type.Object({
+			backend: Type.Optional(Type.String({ description: "Exact backend adapter ID, such as pi or cursor." })),
+			search: Type.Optional(Type.String({ description: "Case-insensitive substring over backend, model, and display_name." })),
+			offset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based result offset. Defaults to 0." })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Page size from 1 through 100. Defaults to 50." })),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			const catalog = await listSubagentModels(ctx, params);
+			return subagentModelToolResult(catalog);
+		},
+		renderCall(args, theme) {
+			const scope = [args.backend, args.search].filter(Boolean).join(" · ") || "all";
+			return new Text(theme.fg("toolTitle", theme.bold("list_subagent_models ")) + theme.fg("accent", scope), 0, 0);
+		},
+		renderResult(result: any, _options, theme) {
+			return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ model listing failed" : `✓ ${result.details?.models?.length ?? 0}/${result.details?.total ?? 0} models`), 0, 0);
+		},
+	});
 
 	pi.registerTool({
 		name: "wait_agent",
@@ -1732,6 +1886,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 				model: info.model,
 				current_activity: manager.currentActivity(info) ?? null,
 				activity_summary: manager.activitySummary(info),
+				elapsed: formatElapsed(info.createdAt),
 				last_task_message: info.lastTaskMessage ?? null,
 				...(params.include_all ? { parent_session_id: info.parentSessionId } : {}),
 			}));
@@ -1865,7 +2020,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 						const index = start + offset;
 						const pointer = index === selected ? theme.fg("accent", "› ") : "  ";
 						const statusColor = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
-						lines.push(pointer + theme.fg(index === selected ? "accent" : "text", info.canonicalName.padEnd(28)) + theme.fg(statusColor, info.status.padEnd(12)) + theme.fg("dim", `${info.backend} · ${info.model}`));
+						lines.push(pointer + theme.fg(index === selected ? "accent" : "text", info.canonicalName.padEnd(28)) + theme.fg(statusColor, info.status.padEnd(12)) + theme.fg("dim", `${info.backend} · ${info.model} · ${formatElapsed(info.createdAt)}`));
 						lines.push(theme.fg("dim", `    ↳ ${manager.activitySummary(info)}`));
 					}
 					const range = infos.length > maxVisible ? ` · ${start + 1}–${Math.min(infos.length, start + maxVisible)} of ${infos.length}` : "";

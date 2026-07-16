@@ -3,11 +3,17 @@ import test from "node:test";
 import {
 	agentActivitySummary,
 	compactActivityText,
+	formatElapsed,
+	formatPersistentWidgetMetadata,
 	JsonlDecoder,
 	normalizeTaskName,
 	parentScopeKey,
 	parseAgentTemplateText,
+	parsePiModel,
+	resolvePiSpawnSelection,
 	selectInheritedPiTools,
+	validatePiModelSelection,
+	validateSpawnPiOptions,
 	SUBAGENT_IDLE_CLOSE_MS,
 	taskStorageKey,
 } from "../extensions/unified.ts";
@@ -53,11 +59,140 @@ Review carefully.`, "fallback");
 	});
 });
 
+test("pi_model parsing trims and splits only at the first slash", () => {
+	assert.deepEqual(parsePiModel("  openrouter/anthropic/claude:beta  "), {
+		provider: "openrouter",
+		modelId: "anthropic/claude:beta",
+	});
+	assert.deepEqual(parsePiModel("provider / model/id:tag "), {
+		provider: "provider",
+		modelId: "model/id:tag",
+	});
+	for (const value of ["", "   ", "provider", "/model", "provider/", " / "]) {
+		assert.throws(() => parsePiModel(value), /provider\/model-id/);
+	}
+});
+
+test("Pi model and thinking resolve independently with explicit, template, parent precedence", () => {
+	assert.deepEqual(resolvePiSpawnSelection({
+		parentModel: { provider: "parent-provider", id: "parent-model" },
+		parentThinking: "low",
+	}), {
+		provider: "parent-provider",
+		modelId: "parent-model",
+		modelSource: "parent",
+		thinking: "low",
+		thinkingSource: "parent",
+	});
+
+	assert.deepEqual(resolvePiSpawnSelection({
+		piModel: "explicit-provider/model/with:route",
+		template: { name: "reviewer", provider: "template-provider", model: "template-model", thinking: "high" },
+		parentModel: { provider: "parent-provider", id: "parent-model" },
+		parentThinking: "low",
+	}), {
+		provider: "explicit-provider",
+		modelId: "model/with:route",
+		modelSource: "explicit",
+		thinking: "high",
+		thinkingSource: "template",
+	});
+
+	assert.deepEqual(resolvePiSpawnSelection({
+		piThinking: "off",
+		template: { name: "reviewer", provider: " template-provider ", model: " template/model:tag ", thinking: "high" },
+		parentThinking: "medium",
+	}), {
+		provider: "template-provider",
+		modelId: "template/model:tag",
+		modelSource: "template",
+		thinking: "off",
+		thinkingSource: "explicit",
+	});
+});
+
+test("complete explicit or template Pi models do not require a parent model", () => {
+	assert.equal(resolvePiSpawnSelection({ piModel: "provider/model" }).modelSource, "explicit");
+	assert.equal(resolvePiSpawnSelection({
+		template: { name: "reviewer", provider: "provider", model: "model" },
+	}).modelSource, "template");
+	assert.throws(
+		() => resolvePiSpawnSelection({ parentThinking: "high" }),
+		/active parent provider\/model/,
+	);
+});
+
+test("thinking-only Pi templates retain the inherited parent model", () => {
+	assert.deepEqual(resolvePiSpawnSelection({
+		template: { name: "deep-reviewer", thinking: "max" },
+		parentModel: { provider: "parent-provider", id: "parent-model" },
+		parentThinking: "low",
+	}), {
+		provider: "parent-provider",
+		modelId: "parent-model",
+		modelSource: "parent",
+		thinking: "max",
+		thinkingSource: "template",
+	});
+});
+
+test("selected incomplete Pi template pairs throw but explicit model bypasses them", () => {
+	for (const template of [
+		{ name: "provider-only", provider: "provider" },
+		{ name: "model-only", model: "model" },
+		{ name: "blank-provider", provider: "  ", model: "model" },
+		{ name: "blank-model", provider: "provider", model: "  " },
+	]) {
+		assert.throws(() => resolvePiSpawnSelection({ template }), /must define both nonempty provider and model/);
+	}
+	assert.deepEqual(resolvePiSpawnSelection({
+		piModel: "explicit/model",
+		template: { name: "malformed", provider: "template-only", thinking: "xhigh" },
+	}), {
+		provider: "explicit",
+		modelId: "model",
+		modelSource: "explicit",
+		thinking: "xhigh",
+		thinkingSource: "template",
+	});
+});
+
+test("explicit and template Pi models are exact-validated while inherited models skip lookup", () => {
+	const calls: Array<[string, string]> = [];
+	validatePiModelSelection(
+		{ provider: "provider", modelId: "model/route:tag", modelSource: "explicit" },
+		(provider, modelId) => {
+			calls.push([provider, modelId]);
+			return { provider, modelId };
+		},
+	);
+	assert.deepEqual(calls, [["provider", "model/route:tag"]]);
+	assert.throws(
+		() => validatePiModelSelection(
+			{ provider: "provider", modelId: "missing", modelSource: "template" },
+			() => undefined,
+		),
+		/Pi model not found: provider\/missing/,
+	);
+	validatePiModelSelection(
+		{ provider: "parent", modelId: "current", modelSource: "parent" },
+		() => { throw new Error("inherited current model must not be revalidated"); },
+	);
+});
+
+test("Pi-only spawn fields are rejected for Cursor", () => {
+	assert.throws(() => validateSpawnPiOptions("cursor", { pi_model: "provider/model" }), /only valid when backend=pi/);
+	assert.throws(() => validateSpawnPiOptions("cursor", { pi_thinking: "off" }), /only valid when backend=pi/);
+	assert.doesNotThrow(() => validateSpawnPiOptions("cursor", {}));
+	assert.doesNotThrow(() => validateSpawnPiOptions("pi", { pi_model: "provider/model", pi_thinking: "max" }));
+});
+
 test("focused tool contract requires an explicit backend and keeps Cursor on ACP", async () => {
 	const { readFile } = await import("node:fs/promises");
 	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
 	for (const tool of [
 		"spawn_agent",
+		"list_subagent_models",
 		"wait_agent",
 		"wait_all_agents",
 		"list_agents",
@@ -69,9 +204,24 @@ test("focused tool contract requires an explicit backend and keeps Cursor on ACP
 	]) assert.match(source, new RegExp(`name: "${tool}"`));
 	assert.match(source, /backend: Backend/);
 	assert.doesNotMatch(source, /backend:\s*Type\.Optional\(Backend\)/);
+	assert.match(source, /pi_model: Type\.Optional\(Type\.String/);
+	assert.match(source, /pi_thinking: Type\.Optional\(PiThinkingSchema\)/);
+	assert.match(source, /const CursorModelSchema = StringEnum\(CURSOR_MODEL_IDS\)/);
+	assert.match(source, /backend: Type\.Optional\(Type\.String/);
+	assert.match(source, /offset: Type\.Optional\(Type\.Integer\(\{ minimum: 0/);
+	assert.match(source, /limit: Type\.Optional\(Type\.Integer\(\{ minimum: 1, maximum: 100/);
+	assert.match(source, /listSubagentModels\(ctx, params\)/);
+	assert.match(source, /subagentModelToolResult\(catalog\)/);
+	assert.match(source, /ctx\.modelRegistry\.find\(provider, modelId\)/);
+	assert.match(source, /model: piSelection \? `\$\{piSelection\.provider\}:\$\{piSelection\.modelId\}` : cursorModel/);
+	assert.match(source, /\.\.\.\(piSelection \? \{[\s\S]*provider: piSelection\.provider,[\s\S]*modelId: piSelection\.modelId,[\s\S]*thinking: piSelection\.thinking,[\s\S]*\} : \{\}\)/);
 	assert.match(source, /new CursorAcpClient/);
 	const acpSource = await readFile(new URL("../extensions/acp.ts", import.meta.url), "utf8");
 	assert.match(acpSource, /session\/load/);
+	assert.match(acpSource, /export const CURSOR_MODEL_IDS/);
+	assert.match(acpSource, /const preset = CURSOR_MODEL_PRESETS\[model\]/);
+	assert.match(source, /isCursorModel\(frontmatter\.cursor_model\)/);
+	assert.match(source, /DEFAULT_CURSOR_MODEL/);
 	assert.doesNotMatch(source, /sendAsyncMessage\(/);
 	assert.match(source, /deliverAs: "followUp"/);
 	assert.match(source, /observedByWaitAll/);
@@ -128,4 +278,37 @@ test("activity summaries prefer sanitized live phases and fall back to the task"
 		"Task · Review activity UI",
 	);
 	assert.equal(agentActivitySummary({ status: "running" }), "Working");
+});
+
+test("agent elapsed time uses the legacy minute-second format", () => {
+	assert.equal(formatElapsed(1_000, 1_000), "0:00");
+	assert.equal(formatElapsed(1_000, 66_000), "1:05");
+	assert.equal(formatElapsed(1_000, 3_662_000), "61:01");
+});
+
+test("persistent widget metadata formats Pi thinking and legacy unknown exactly", () => {
+	const now = 66_000;
+	assert.equal(formatPersistentWidgetMetadata({
+		backend: "pi",
+		model: "openai-codex:gpt-5.6-terra",
+		thinking: "high",
+		status: "running",
+		createdAt: 1_000,
+	}, now), "[pi] openai-codex:gpt-5.6-terra · thinking high · running · 1:05");
+	assert.equal(formatPersistentWidgetMetadata({
+		backend: "pi",
+		model: "legacy:model",
+		status: "completed",
+		createdAt: 1_000,
+	}, now), "[pi] legacy:model · thinking unknown · completed · 1:05");
+});
+
+test("persistent widget metadata omits stale thinking for Cursor exactly", () => {
+	assert.equal(formatPersistentWidgetMetadata({
+		backend: "cursor",
+		model: "Grok 4.5 High",
+		thinking: "max",
+		status: "failed",
+		createdAt: 1_000,
+	}, 66_000), "[cursor] Grok 4.5 High · failed · 1:05");
 });
