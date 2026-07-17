@@ -342,6 +342,8 @@ test("v2 metrics and compaction records reject identifiers and render Cursor ava
 	assert.equal(normalizeRunLedgerEvent({ ...(metrics as any), sessionId: "never" }), undefined);
 	const pi = renderRunLedgerText(renderRunLedger(reduceRunLedgerEvents([metrics!, compact!]), { width: 100, height: 3 }));
 	assert.match(pi, /usage 3 .* context — .* compactions 4/);
+	const context = normalizeRunLedgerEvent({ ...(metrics as any), seq: 3, contextUsage: { tokens: 2215, contextWindow: 372000, percent: 0.5954301075 } });
+	assert.match(renderRunLedgerText(renderRunLedger(reduceRunLedgerEvents([context!]), { width: 120, height: 2 })), /context 2215\/372000 0\.6%/);
 	const cursor = renderRunLedgerText(renderRunLedger(reduceRunLedgerEvents([normalizeRunLedgerEvent({ v: 2, seq: 1, ts: at, turn: 1, kind: "run", runId: "c", backend: "cursor" })!]), { width: 100, height: 2 }));
 	assert.match(cursor, /usage — .* context — .* compactions —/);
 });

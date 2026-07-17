@@ -765,7 +765,10 @@ export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerO
 	if (state.error) fixed.push(line({ role: "error", text: fit(`Error${state.error.code ? ` ${state.error.code}` : ""} · ${state.error.message}`, width) }));
 	if (state.task) fixed.push(line({ role: "task", text: fit(`Task · ${state.task}`, width) }));
 	const compactionCount = Math.max(state.metrics?.compactionCount ?? 0, state.compaction?.compactionCount ?? 0);
-	const usage = state.backend === "cursor" ? "usage — · context — · compactions —" : state.metrics ? `usage ${state.metrics.totalTokens} · context ${state.metrics.contextUsage?.tokens ?? "—"} · compactions ${compactionCount}` : state.compaction ? `usage — · context — · compactions ${compactionCount}` : undefined;
+	const context = state.metrics?.contextUsage?.tokens == null
+		? "—"
+		: `${state.metrics.contextUsage.tokens}/${state.metrics.contextUsage.contextWindow}${state.metrics.contextUsage.percent == null ? "" : ` ${Math.round(state.metrics.contextUsage.percent * 10) / 10}%`}`;
+	const usage = state.backend === "cursor" ? "usage — · context — · compactions —" : state.metrics ? `usage ${state.metrics.totalTokens} · context ${context} · compactions ${compactionCount}` : state.compaction ? `usage — · context — · compactions ${compactionCount}` : undefined;
 	const compaction = state.backend === "cursor" || !state.compaction ? undefined : `compact ${state.compaction.state}${state.compaction.willRetry ? " · retry" : ""}`;
 	const metadata = [state.backend, state.model, state.thinking ? `thinking ${state.thinking}` : undefined, usage, compaction, state.cwd].filter((value): value is string => !!value).join(" · ");
 	if (metadata) fixed.push(line({ role: "muted", text: fit(metadata, width) }));

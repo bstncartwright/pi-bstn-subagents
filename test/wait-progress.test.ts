@@ -17,6 +17,6 @@ test("compact wait rows expose safe target state and backend-honest metrics", as
 		{ id: "a", agentName: "/a", backend: "pi", model: "m", status: "queued", createdAt: 0, updatedAt: 1, lastActivityAt: 1, activity: "token=private", queuePosition: 2, permissionPending: false, metrics: { sampledAt: 1, inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 5, cost: 0, contextUsage: { tokens: 20, contextWindow: 100, percent: 20 }, compactionCount: 1 } },
 		{ id: "b", agentName: "/b", backend: "cursor", model: "Auto", status: "running", createdAt: 0, updatedAt: 1, lastActivityAt: 1, activity: "Working", permissionPending: true },
 	], 0, 2_000);
-	assert.equal(formatWaitProgressRows(progress), "Waiting 0/2 settled · 1 active · 1 queued · 1 approval · 0:02\n/a [pi] queued · queue #2 · usage 5 · context 20/100 · compactions 1\n/b [cursor] running · Working · usage — · context — · compactions —");
+	assert.equal(formatWaitProgressRows(progress), "Waiting 0/2 settled · 1 active · 1 queued · 1 approval · 0:02\n/a [pi] queued · queue #2 · usage 5 · context 20/100 20% · compactions 1\n/b [cursor] running · Working · usage — · context — · compactions —");
 	assert.doesNotMatch(formatWaitProgressRows(progress), /private|token|prompt|response|cwd/i);
 });

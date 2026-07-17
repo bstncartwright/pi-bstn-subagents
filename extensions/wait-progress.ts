@@ -33,7 +33,7 @@ function compact(value: unknown, max = 72): string {
 function usage(agent: WaitProgressAgent): string {
 	if (agent.backend === "cursor") return "usage — · context — · compactions —";
 	const metrics = agent.metrics; if (!metrics) return "usage — · context — · compactions —";
-	const context = metrics.contextUsage?.tokens == null ? "—" : metrics.contextUsage.contextWindow ? `${metrics.contextUsage.tokens}/${metrics.contextUsage.contextWindow}` : String(metrics.contextUsage.tokens);
+	const context = metrics.contextUsage?.tokens == null ? "—" : `${metrics.contextUsage.tokens}/${metrics.contextUsage.contextWindow}${metrics.contextUsage.percent == null ? "" : ` ${Math.round(metrics.contextUsage.percent * 10) / 10}%`}`;
 	return `usage ${metrics.totalTokens} · context ${context} · compactions ${metrics.compactionCount}`;
 }
 /** Compact, terminal-safe partial rows for foreground wait renderers. */
