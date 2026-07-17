@@ -157,7 +157,7 @@ Persisted metadata and UI continue to display Pi models as `provider:modelId`.
 6. Use `send_message` for follow-up work. Settled work queues a new turn; sends to queued/admitted turns reject. Pi steers an active turn, while Cursor cancels it and transfers its active slot to a distinct corrective turn.
 7. Call `close_agent` when the session is no longer needed.
 
-Wait tools have no model-facing timeout and honor cancellation of their tool call. Never tell the parent model to sleep or poll. If no active wait consumes a completion, the extension automatically delivers the result as a Pi `followUp` message and triggers a parent turn. An active wait receives the event directly instead, avoiding duplicate delivery. Cursor permission requests use the same rule.
+Wait tools have no model-facing timeout and honor cancellation of their tool call. They stream safe aggregate foreground progress while waiting; never tell the parent model to sleep or poll. If no active wait consumes a completion, the extension automatically delivers the result as a Pi `followUp` message and triggers a parent turn. An active wait receives the event directly instead, avoiding duplicate delivery. Cursor permission requests use the same rule.
 
 Completed, failed, interrupted, or reload-paused subagents remain available for follow-up work for 15 minutes. A reload never resumes old work: queued turns become `paused` (`shutdown-paused`) and admitted/running turns become interrupted. Send an explicit new message to queue fresh work. Starting another turn resets that window; after 15 idle minutes the backend process and Herdr viewer close automatically while persisted result history remains available.
 
@@ -197,7 +197,7 @@ Runtime data is stored under:
     └── <id>.session.jsonl   # Pi backend
 ```
 
-The private manifest is the sole lifecycle authority. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
+The private manifest is the sole lifecycle authority. It is currently schema v2 and strictly upgrades v1 manifests under the manifest lock; old journals remain readable. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
 
 Optional `config.json`:
 
@@ -254,7 +254,7 @@ The explicit `backend` passed to `spawn_agent` must agree with the template. Pi 
 
 ## UI and Herdr
 
-Every newly created backend gets a background Herdr **Run Ledger** viewer tab. These tabs are viewers only and are not registered as Herdr agents. The built-in viewer follows the private semantic journal with a compact identity/status/task header, thought previews, response chunks, tool lifecycle and permission/error/completion state. It falls back safely to the legacy raw event log when a journal is absent, partial, or unusable. Existing tabs and the Pi overlay remain raw-log based in this phase; no overlay controls or behavior changed.
+Every newly created backend gets a background Herdr **Run Ledger** viewer tab. These tabs are viewers only and are not registered as Herdr agents. The built-in viewer follows the private semantic journal with a compact identity/status/task header, thought previews, response chunks, tool lifecycle and permission/error/completion state. It falls back safely to the legacy raw event log when a journal is absent, partial, or unusable. Existing tabs and the Pi overlay remain raw-log based in this phase; no overlay controls or behavior changed. Pi Run Ledger entries also show authoritative cumulative session usage, Pi's reported current-context estimate, and absolute compaction count. Cursor usage/context/compaction are deliberately shown as `—`, never estimated.
 
 - `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline that switches to a compact final-response summary after settlement.
 - `/subagent <task-name>` opens one current-session agent.

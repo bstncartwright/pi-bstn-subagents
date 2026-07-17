@@ -44,11 +44,17 @@ export interface HerdrAgent {
 }
 
 export interface PiRuntime {
+	/** Strict, numeric-only Pi session totals; never exposes session identifiers. */
+	getSessionStats?(): Promise<PiSessionStats>;
 	start(): Promise<void>;
 	prompt(message: string, turnToken?: string): Promise<void>;
 	steer(message: string): Promise<void>;
 	abort(): Promise<void>;
 	close(): Promise<void>;
+}
+
+export interface PiSessionStats {
+	inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number; cost: number; contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null };
 }
 
 export interface CursorRuntime {
@@ -65,23 +71,15 @@ export interface HerdrOperations {
 	reportParent?(working: boolean): Promise<void>;
 }
 
+export interface AgentMetricsSnapshot extends PiSessionStats { sampledAt: number; compactionCount: number; }
 export interface AgentStateSnapshot {
-	id: string;
-	agentName: string;
-	backend: "pi" | "cursor";
-	model: string;
-	thinking?: string;
+	id: string; agentName: string; backend: "pi" | "cursor"; model: string; thinking?: string;
 	status: "queued" | "starting" | "running" | "completed" | "failed" | "interrupted" | "paused" | "closed";
-	createdAt: number;
-	updatedAt: number;
-	startedAt?: number;
-	completedAt?: number;
-	closedAt?: number;
-	lastActivityAt: number;
-	/** Sanitized runtime phase/tool metadata only. */
-	activity: string | null;
+	createdAt: number; updatedAt: number; startedAt?: number; completedAt?: number; closedAt?: number; lastActivityAt: number;
+	/** Sanitized runtime phase/tool metadata only. */ activity: string | null;
+	turnId?: string; turnSequence?: number; terminalReason?: string; queuePosition?: number; permissionPending: boolean;
+	/** Pi only; Cursor intentionally has no estimates. */ metrics?: AgentMetricsSnapshot;
 }
-
 export interface ManagerStateSnapshot {
 	parentSessionId: string;
 	agents: AgentStateSnapshot[];

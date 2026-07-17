@@ -6,7 +6,7 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-export const TURN_MANIFEST_VERSION = 1 as const;
+export const TURN_MANIFEST_VERSION = 2 as const;
 export const TURN_MANIFEST_FILE = "queue.manifest.json";
 export const TURN_MANIFEST_LOCK_FILE = ".lock";
 export const TURN_MANIFEST_RECLAIM_FILE = ".lock.reclaim";
@@ -71,6 +71,18 @@ export interface ManifestTurn {
 	response?: ResponseReference;
 }
 
+export interface AgentMetrics {
+	sampledAt: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	totalTokens: number;
+	cost: number;
+	contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null };
+	compactionCount: number;
+}
+
 export interface ManifestAgent {
 	id: string;
 	taskName: string;
@@ -106,9 +118,11 @@ export interface ManifestAgent {
 	closed: boolean;
 	closedAt?: number;
 	closeReason?: string;
+	/** Pi-only numeric session totals; never session ids/files or text. */
+	metrics?: AgentMetrics;
 }
 
-export interface ParentManifestV1 {
+export interface ParentManifestV2 {
 	version: typeof TURN_MANIFEST_VERSION;
 	parentSessionId: string;
 	epoch: string;
@@ -117,6 +131,8 @@ export interface ParentManifestV1 {
 	agents: Record<string, ManifestAgent>;
 	turns: Record<string, ManifestTurn>;
 }
+/** Compatibility type name for existing internal callers; emitted schema is v2. */
+export type ParentManifestV1 = ParentManifestV2;
 
 export interface AgentInfoProjection {
 	id: string;
@@ -160,6 +176,7 @@ export interface AgentInfoProjection {
 	terminalReason?: string;
 	response?: ResponseReference;
 	finalResponse?: string;
+	metrics?: AgentMetrics;
 }
 
 export interface AddAgentInput extends Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "closedAt" | "closeReason"> {
@@ -244,9 +261,14 @@ export function createParentManifest(parentSessionId: string, epoch: string, now
 export interface ParseManifestOptions { scopeDir?: string; }
 
 export function parseParentManifest(input: unknown, options: ParseManifestOptions = {}): ParentManifestV1 {
-	const root = object(input, "manifest");
-	exactKeys(root, ["version", "parentSessionId", "epoch", "nextSequence", "updatedAt", "agents", "turns"], "manifest");
-	if (root.version !== TURN_MANIFEST_VERSION) fail(`version ${String(root.version)} is unsupported`);
+	const root = { ...object(input, "manifest") };
+	const allowedRoot = ["version", "parentSessionId", "epoch", "nextSequence", "updatedAt", "agents", "turns"];
+	exactKeys(root, allowedRoot, "manifest");
+	// v1 had no metrics. Upgrade only this exact durable shape, then validate as v2.
+	if (root.version === 1) {
+		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && Object.prototype.hasOwnProperty.call(rawAgent, "metrics")) fail("v1 manifest must not contain metrics");
+		root.version = TURN_MANIFEST_VERSION;
+	} else if (root.version !== TURN_MANIFEST_VERSION) fail(`version ${String(root.version)} is unsupported`);
 	const manifest: ParentManifestV1 = {
 		version: TURN_MANIFEST_VERSION,
 		parentSessionId: string(root.parentSessionId, "manifest.parentSessionId"),
@@ -298,16 +320,25 @@ function parseTurn(raw: unknown, path: string): ManifestTurn {
 		terminalStatus, terminalReason: optionalString(value.terminalReason, `${path}.terminalReason`), error: optionalString(value.error, `${path}.error`), response: parseResponse(value.response, `${path}.response`),
 	};
 }
+function parseMetrics(raw: unknown, path: string): AgentMetrics | undefined {
+	if (raw === undefined) return undefined;
+	const value = object(raw, path); exactKeys(value, ["sampledAt", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "cost", "contextUsage", "compactionCount"], path);
+	const cost = value.cost;
+	if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) fail(`${path}.cost must be finite and nonnegative`);
+	let contextUsage: AgentMetrics["contextUsage"];
+	if (value.contextUsage !== undefined) { const context = object(value.contextUsage, `${path}.contextUsage`); exactKeys(context, ["tokens", "contextWindow", "percent"], `${path}.contextUsage`); const tokens = context.tokens; const percent = context.percent; if (tokens !== null && (!Number.isSafeInteger(tokens) || (tokens as number) < 0)) fail(`${path}.contextUsage.tokens must be a nonnegative safe integer or null`); if (percent !== null && (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0)) fail(`${path}.contextUsage.percent must be finite and nonnegative or null`); contextUsage = { tokens: tokens as number | null, contextWindow: safeInt(context.contextWindow, `${path}.contextUsage.contextWindow`), percent: percent as number | null }; }
+	return { sampledAt: safeInt(value.sampledAt, `${path}.sampledAt`), inputTokens: safeInt(value.inputTokens, `${path}.inputTokens`), outputTokens: safeInt(value.outputTokens, `${path}.outputTokens`), cacheReadTokens: safeInt(value.cacheReadTokens, `${path}.cacheReadTokens`), cacheWriteTokens: safeInt(value.cacheWriteTokens, `${path}.cacheWriteTokens`), totalTokens: safeInt(value.totalTokens, `${path}.totalTokens`), cost, ...(contextUsage ? { contextUsage } : {}), compactionCount: safeInt(value.compactionCount, `${path}.compactionCount`) };
+}
 function parseAgent(raw: unknown, path: string): ManifestAgent {
 	const value = object(raw, path);
-	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason"], path);
+	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason", "metrics"], path);
 	return {
 		id: opaqueId(value.id, `${path}.id`), taskName: string(value.taskName, `${path}.taskName`), canonicalName: string(value.canonicalName, `${path}.canonicalName`), backend: enumValue(value.backend, ["pi", "cursor"] as const, `${path}.backend`),
 		parentSessionId: string(value.parentSessionId, `${path}.parentSessionId`), parentSessionFile: optionalString(value.parentSessionFile, `${path}.parentSessionFile`), agentType: optionalString(value.agentType, `${path}.agentType`), cwd: string(value.cwd, `${path}.cwd`), model: string(value.model, `${path}.model`),
 		provider: optionalString(value.provider, `${path}.provider`), modelId: optionalString(value.modelId, `${path}.modelId`), thinking: optionalString(value.thinking, `${path}.thinking`), tools: optionalString(value.tools, `${path}.tools`), skills: strings(value.skills, `${path}.skills`), skillPaths: strings(value.skillPaths, `${path}.skillPaths`), extensions: strings(value.extensions, `${path}.extensions`), extensionPaths: strings(value.extensionPaths, `${path}.extensionPaths`),
 		cursorModel: optionalString(value.cursorModel, `${path}.cursorModel`), permissionMode: enumValue(value.permissionMode, ["agent", "prompt", "allow-once", "deny"] as const, `${path}.permissionMode`), acpSessionId: optionalString(value.acpSessionId, `${path}.acpSessionId`), acpCapabilities: capabilities(value.acpCapabilities, `${path}.acpCapabilities`), sessionFile: optionalString(value.sessionFile, `${path}.sessionFile`),
 		infoFile: string(value.infoFile, `${path}.infoFile`), logFile: string(value.logFile, `${path}.logFile`), responseFile: string(value.responseFile, `${path}.responseFile`), viewerPaneId: optionalString(value.viewerPaneId, `${path}.viewerPaneId`), viewerTabId: optionalString(value.viewerTabId, `${path}.viewerTabId`),
-		createdAt: safeInt(value.createdAt, `${path}.createdAt`), updatedAt: safeInt(value.updatedAt, `${path}.updatedAt`), currentTurnId: optionalString(value.currentTurnId, `${path}.currentTurnId`), nextOrdinal: safeInt(value.nextOrdinal, `${path}.nextOrdinal`), closed: bool(value.closed, `${path}.closed`), closedAt: value.closedAt === undefined ? undefined : safeInt(value.closedAt, `${path}.closedAt`), closeReason: optionalString(value.closeReason, `${path}.closeReason`),
+		createdAt: safeInt(value.createdAt, `${path}.createdAt`), updatedAt: safeInt(value.updatedAt, `${path}.updatedAt`), currentTurnId: optionalString(value.currentTurnId, `${path}.currentTurnId`), nextOrdinal: safeInt(value.nextOrdinal, `${path}.nextOrdinal`), closed: bool(value.closed, `${path}.closed`), closedAt: value.closedAt === undefined ? undefined : safeInt(value.closedAt, `${path}.closedAt`), closeReason: optionalString(value.closeReason, `${path}.closeReason`), metrics: parseMetrics(value.metrics, `${path}.metrics`),
 	};
 }
 
@@ -322,7 +353,7 @@ function sameOptional(left: string | undefined, right: string | undefined): bool
 function assertBackendConfig(agent: ManifestAgent): void {
 	if (agent.backend === "pi") { assert(!!agent.provider && !!agent.modelId, `Pi agent ${agent.id} requires provider and modelId`); return; }
 	assert(!!agent.cursorModel, `Cursor agent ${agent.id} requires cursorModel`);
-	assert(agent.provider === undefined && agent.modelId === undefined && agent.thinking === undefined && agent.tools === undefined && agent.sessionFile === undefined, `Cursor agent ${agent.id} has Pi-only config`);
+	assert(agent.provider === undefined && agent.modelId === undefined && agent.thinking === undefined && agent.tools === undefined && agent.sessionFile === undefined && agent.metrics === undefined, `Cursor agent ${agent.id} has Pi-only config`);
 	assert(agent.skills.length === 0 && agent.skillPaths.length === 0 && agent.extensions.length === 0 && agent.extensionPaths.length === 0, `Cursor agent ${agent.id} must not have skills or extensions`);
 }
 function assertExecutionMatchesAgent(turn: ManifestTurn, agent: ManifestAgent): void {
@@ -498,6 +529,13 @@ export function updateAgentRuntimeResources(manifest: ParentManifestV1, agentId:
 	agent.updatedAt = now; next.updatedAt = now; validateManifest(next); return next;
 }
 
+/** Narrow Pi-only metrics mutation. It cannot carry identity, files, prompts, or textual payloads. */
+export function updateAgentMetrics(manifest: ParentManifestV1, agentId: string, metrics: AgentMetrics, now: number): ParentManifestV1 {
+	const agent = manifest.agents[agentId]; if (!agent) fail(`agent ${agentId} does not exist`); assert(agent.backend === "pi", `agent ${agentId} metrics are Pi-only`); assertMutationTime(manifest, now); assert(now >= agent.updatedAt, `mutation time precedes agent ${agentId} updatedAt`);
+	const checked = parseMetrics(metrics, "agent metrics"); if (!checked || checked.sampledAt > now) fail("agent metrics sampledAt exceeds mutation time");
+	const next = clone(manifest); next.agents[agentId]!.metrics = checked; next.agents[agentId]!.updatedAt = now; next.updatedAt = now; validateManifest(next); return next;
+}
+
 /** Closes an agent and atomically interrupts its current queued/admitted/running turn, if any. */
 export function closeAgent(manifest: ParentManifestV1, agentId: string, reason: string, now: number): ParentManifestV1 {
 	const original = manifest.agents[agentId]; if (!original) fail(`agent ${agentId} does not exist`); string(reason, "close reason");
@@ -563,7 +601,7 @@ export function projectAgent(agent: ManifestAgent, turn: ManifestTurn | undefine
 		id: agent.id, taskName: agent.taskName, canonicalName: agent.canonicalName, backend: agent.backend, parentSessionId: agent.parentSessionId, parentSessionFile: agent.parentSessionFile, agentType: agent.agentType, cwd: agent.cwd, model: agent.model, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools,
 		skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, acpSessionId: agent.acpSessionId, acpCapabilities: agent.acpCapabilities ? { ...agent.acpCapabilities } : undefined, sessionFile: agent.sessionFile,
 		infoFile: agent.infoFile, logFile: agent.logFile, responseFile: agent.responseFile, viewerPaneId: agent.viewerPaneId, viewerTabId: agent.viewerTabId, createdAt: agent.createdAt, updatedAt: agent.updatedAt, startedAt: turn?.startedAt ?? turn?.admittedAt, completedAt: turn?.completedAt, closedAt: agent.closedAt, lastActivity: turn?.lastActivityAt ?? agent.updatedAt, turn: turn?.ordinal ?? Math.max(0, agent.nextOrdinal - 1), status, lastTaskMessage: turn?.execution.displayMessage, error: turn?.error, currentTurnId: agent.currentTurnId, terminalReason: turn?.terminalReason,
-		response: turn?.response ? { ...turn.response } : undefined, finalResponse: turn?.response ? options.readResponse?.(turn.response) : undefined,
+		response: turn?.response ? { ...turn.response } : undefined, finalResponse: turn?.response ? options.readResponse?.(turn.response) : undefined, metrics: agent.metrics ? { ...agent.metrics, ...(agent.metrics.contextUsage ? { contextUsage: { ...agent.metrics.contextUsage } } : {}) } : undefined,
 	};
 }
 export function materializeAgentProjections(manifest: ParentManifestV1, options: ProjectionOptions = {}): AgentInfoProjection[] {
@@ -704,7 +742,7 @@ export class TurnManifestStore {
 	initialize(manifest: ParentManifestV1): ParentManifestV1 {
 		this.ensureScope(); const canonical = parseParentManifest(manifest, { scopeDir: this.scopeDir });
 		if (existsSync(this.manifestPath)) {
-			const existing = this.read();
+			const existing = this.upgradeV1IfNeeded();
 			if (existing.parentSessionId !== canonical.parentSessionId) throw new Error(`Turn manifest parent session differs at ${this.manifestPath}; refusing initialization.`);
 			return existing;
 		}
@@ -713,8 +751,18 @@ export class TurnManifestStore {
 			if (!existsSync(this.manifestPath)) return this.writeAtomic(canonical);
 			const existing = this.read();
 			if (existing.parentSessionId !== canonical.parentSessionId) throw new Error(`Turn manifest parent session differs at ${this.manifestPath}; refusing initialization.`);
-			return existing;
+			// We already own the lock, so atomically materialize a parsed v1 upgrade if needed.
+			return this.writeAtomic(existing);
 		} finally { this.release(lock); }
+	}
+	/** Upgrade an existing v1 file only while its epoch lock is held. */
+	private upgradeV1IfNeeded(): ParentManifestV1 {
+		const text = this.readBounded(this.manifestPath, MAX_MANIFEST_BYTES, "manifest"); let raw: any;
+		try { raw = JSON.parse(text); } catch { return this.read(); }
+		const existing = this.read(); if (raw?.version !== 1) return existing;
+		const lock = this.acquire(existing.epoch);
+		try { const currentText = this.readBounded(this.manifestPath, MAX_MANIFEST_BYTES, "manifest"); const currentRaw = JSON.parse(currentText); const current = this.read(); if (currentRaw?.version === 1) return this.writeAtomic(current); return current; }
+		finally { this.release(lock); }
 	}
 	release(lock: ManifestLock): void {
 		this.ensureScope();

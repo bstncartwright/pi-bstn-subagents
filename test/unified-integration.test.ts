@@ -41,11 +41,19 @@ class FakeRuntimes {
 	private readonly closeResolvers = new Map<string, () => void>();
 	private readonly blockedCloses = new Set<string>();
 	readonly cursor = new Map<string, { handlers: any; message?: string; token?: string }>();
+	private readonly heldStats = new Map<string, (value: any) => void>();
+	private readonly holdStatsFor = new Set<string>();
+	readonly statsCalls = new Map<string, number>();
+	private readonly failStatsFor = new Set<string>();
+	failStats(name: string) { this.failStatsFor.add(name); }
+	holdStats(name: string) { this.holdStatsFor.add(name); }
+	releaseStats(name: string, value = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2, cost: 0 }) { this.holdStatsFor.delete(name); this.heldStats.get(name)?.(value); this.heldStats.delete(name); }
 	createPi = (info: PiRuntimeAgent, handlers: { onEvent(event: unknown, turnToken?: string): void; onExit(error?: Error): void }): PiRuntime => {
 		const runtimes = this;
 		runtimes.pi.set(info.canonicalName, { handlers });
 		return {
 			async start() {},
+			async getSessionStats() { runtimes.statsCalls.set(info.canonicalName, (runtimes.statsCalls.get(info.canonicalName) ?? 0) + 1); if (runtimes.failStatsFor.has(info.canonicalName)) throw new Error("stats failed"); if (!runtimes.holdStatsFor.has(info.canonicalName)) return { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2, cost: 0 }; return await new Promise<any>((resolve) => runtimes.heldStats.set(info.canonicalName, resolve)); },
 			async prompt(message, token) { const record = runtimes.pi.get(info.canonicalName)!; record.message = message; record.token = token; },
 			async steer(message) { runtimes.pi.get(info.canonicalName)!.message = message; },
 			async abort() {},
@@ -249,5 +257,48 @@ test("listener failures, permission/activity transitions, Cursor path, and faile
 		await turn();
 		await failApi.emit("session_shutdown");
 		assert.equal(failEvents.filter((event) => event.startsWith("viewer:close:/fails")).length, 1);
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+
+test("a stale Pi metrics refresh cannot mutate an interrupted lifecycle", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-metrics-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; })); const ctx = context("parent-metrics", root);
+	try {
+		runtimes.holdStats("/metrics");
+		await execute(api, "spawn_agent", { task_name: "metrics", message: "hold", backend: "pi" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await execute(api, "interrupt_agent", { target: "metrics" }, ctx);
+		runtimes.releaseStats("/metrics"); await new Promise((resolve) => setTimeout(resolve, 10));
+		const state = observer.snapshot("parent-metrics").agents.find((agent) => agent.agentName === "/metrics");
+		assert.equal(state?.status, "interrupted"); assert.equal(state?.metrics, undefined);
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+
+test("a dirty Pi stats hint during an in-flight refresh is rate-limited to the next second", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-rate-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi();
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, () => {})); const ctx = context("parent-rate", root);
+	try {
+		runtimes.holdStats("/rate"); await execute(api, "spawn_agent", { task_name: "rate", message: "hold", backend: "pi" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 15)); assert.equal(runtimes.statsCalls.get("/rate"), 1);
+		runtimes.emitPi("/rate", { type: "metrics_hint" }); runtimes.releaseStats("/rate");
+		await new Promise((resolve) => setTimeout(resolve, 80)); assert.equal(runtimes.statsCalls.get("/rate"), 1, "second request must not start inside the first run");
+		await new Promise((resolve) => setTimeout(resolve, 1_050)); assert.equal(runtimes.statsCalls.get("/rate"), 2);
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+
+test("completed compaction durably increments an existing sample when its refresh fails", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-compaction-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; })); const ctx = context("parent-compaction", root);
+	try {
+		await execute(api, "spawn_agent", { task_name: "compact", message: "hold", backend: "pi" }, ctx); await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(observer.snapshot("parent-compaction").agents.find((agent) => agent.agentName === "/compact")?.metrics?.compactionCount, 0);
+		runtimes.failStats("/compact"); runtimes.emitPi("/compact", { type: "compaction", state: "completed", tokensBefore: 10, estimatedTokensAfter: 2, willRetry: true });
+		assert.equal(observer.snapshot("parent-compaction").agents.find((agent) => agent.agentName === "/compact")?.metrics?.compactionCount, 1);
+		await new Promise((resolve) => setTimeout(resolve, 1_050));
+		const metrics = observer.snapshot("parent-compaction").agents.find((agent) => agent.agentName === "/compact")?.metrics;
+		assert.equal(metrics?.compactionCount, 1); assert.equal(metrics?.totalTokens, 2);
 	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
 });

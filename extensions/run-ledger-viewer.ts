@@ -66,17 +66,28 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 function string(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value : undefined; }
 function number(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
+function safeInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined; }
+/** The viewer accepts only the same numeric-only Pi metrics durable schema. */
+function viewerMetrics(value: unknown): RunLedgerStateSeed["metrics"] {
+	const raw = asRecord(value); if (!raw || Object.keys(raw).some((key) => !["sampledAt", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "cost", "contextUsage", "compactionCount"].includes(key))) return undefined;
+	const sampledAt = safeInteger(raw.sampledAt), inputTokens = safeInteger(raw.inputTokens), outputTokens = safeInteger(raw.outputTokens), cacheReadTokens = safeInteger(raw.cacheReadTokens), cacheWriteTokens = safeInteger(raw.cacheWriteTokens), totalTokens = safeInteger(raw.totalTokens), compactionCount = safeInteger(raw.compactionCount), cost = number(raw.cost);
+	if ([sampledAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, compactionCount].some((entry) => entry === undefined) || cost === undefined || cost < 0) return undefined;
+	let contextUsage: NonNullable<RunLedgerStateSeed["metrics"]>["contextUsage"];
+	if (raw.contextUsage !== undefined) { const context = asRecord(raw.contextUsage); if (!context || Object.keys(context).some((key) => !["tokens", "contextWindow", "percent"].includes(key)) || !Object.prototype.hasOwnProperty.call(context, "tokens") || !Object.prototype.hasOwnProperty.call(context, "contextWindow") || !Object.prototype.hasOwnProperty.call(context, "percent") || (context.tokens !== null && safeInteger(context.tokens) === undefined) || safeInteger(context.contextWindow) === undefined || (context.percent !== null && (number(context.percent) === undefined || (context.percent as number) < 0))) return undefined; contextUsage = { tokens: context.tokens as number | null, contextWindow: context.contextWindow as number, percent: context.percent as number | null }; }
+	return { sampledAt: sampledAt!, inputTokens: inputTokens!, outputTokens: outputTokens!, cacheReadTokens: cacheReadTokens!, cacheWriteTokens: cacheWriteTokens!, totalTokens: totalTokens!, cost, ...(contextUsage ? { contextUsage } : {}), compactionCount: compactionCount! };
+}
 
 /** Private info is only a seed; malformed/old info must never prevent rendering. */
 export function seedFromViewerInfo(path: string): RunLedgerStateSeed {
 	let raw: Record<string, unknown> | undefined;
 	try { raw = asRecord(JSON.parse(readFileSync(path, "utf8"))); } catch { return {}; }
 	if (!raw) return {};
+	const backend = string(raw.backend);
 	return {
 		runId: string(raw.id),
 		title: string(raw.canonicalName) ?? string(raw.taskName),
 		agentName: string(raw.canonicalName) ?? string(raw.taskName),
-		backend: string(raw.backend),
+		backend,
 		model: string(raw.model),
 		thinking: string(raw.thinking),
 		cwd: string(raw.cwd),
@@ -84,6 +95,7 @@ export function seedFromViewerInfo(path: string): RunLedgerStateSeed {
 		runtimeState: string(raw.status),
 		turn: number(raw.turn),
 		startedAt: number(raw.startedAt) ?? number(raw.createdAt),
+		metrics: backend === "pi" ? viewerMetrics(raw.metrics) : undefined,
 	};
 }
 

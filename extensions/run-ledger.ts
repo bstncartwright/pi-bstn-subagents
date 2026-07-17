@@ -4,7 +4,8 @@
  * reduced state contain only bounded, terminal-safe summaries.
  */
 
-export const RUN_LEDGER_VERSION = 1 as const;
+export const RUN_LEDGER_VERSION = 2 as const;
+export type RunLedgerVersion = 1 | 2;
 export const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
 export const DEFAULT_MAX_INPUT_LINES = 10_000;
 export const MAX_PARSE_INPUT_BYTES = 4 * 1024 * 1024;
@@ -29,10 +30,12 @@ export type RunLedgerKind =
 	| "tool-end"
 	| "permission"
 	| "error"
-	| "completion";
+	| "completion"
+	| "metrics"
+	| "compaction";
 
 export interface RunLedgerBase extends RunMetadata {
-	v: typeof RUN_LEDGER_VERSION;
+	v: RunLedgerVersion;
 	seq: number;
 	ts: number;
 	turn: number;
@@ -117,6 +120,20 @@ export interface CompletionEvent extends RunLedgerBase {
 	status: string;
 	summary?: string;
 }
+export interface MetricsEvent extends RunLedgerBase {
+	kind: "metrics";
+	sampledAt: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number; cost: number; contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null }; compactionCount: number;
+}
+export interface CompactionEvent extends RunLedgerBase {
+	kind: "compaction";
+	state: "started" | "completed" | "aborted" | "failed";
+	reason?: "manual" | "threshold" | "overflow";
+	tokensBefore?: number;
+	estimatedTokensAfter?: number;
+	willRetry?: boolean;
+	/** Absolute count makes a bounded journal tail safe. */
+	compactionCount: number;
+}
 
 export type RunLedgerEvent =
 	| RunEvent
@@ -130,7 +147,9 @@ export type RunLedgerEvent =
 	| ToolEndEvent
 	| PermissionEvent
 	| ErrorEvent
-	| CompletionEvent;
+	| CompletionEvent
+	| MetricsEvent
+	| CompactionEvent;
 
 export interface SummaryBounds {
 	maxDepth?: number;
@@ -386,7 +405,7 @@ export function thoughtPreview(value: unknown, maxLength = MAX_THOUGHT_PREVIEW_L
 function normalizeKind(value: unknown): RunLedgerKind | undefined {
 	if (typeof value !== "string") return undefined;
 	const kind = value.toLowerCase().replace(/_/g, "-");
-	return ["run", "runtime", "task", "phase", "thought", "response", "tool-start", "tool-update", "tool-end", "permission", "error", "completion"].includes(kind)
+	return ["run", "runtime", "task", "phase", "thought", "response", "tool-start", "tool-update", "tool-end", "permission", "error", "completion", "metrics", "compaction"].includes(kind)
 		? (kind as RunLedgerKind)
 		: undefined;
 }
@@ -405,13 +424,14 @@ function metadata(raw: Record<string, unknown>): RunMetadata {
 /** Normalize an untrusted event into the v1, summary-only journal contract. */
 export function normalizeRunLedgerEvent(value: unknown): RunLedgerEvent | undefined {
 	const raw = record(value);
-	if (!raw || (raw.v !== RUN_LEDGER_VERSION && raw.version !== RUN_LEDGER_VERSION)) return undefined;
+	const version = raw?.v ?? raw?.version;
+	if (!raw || (version !== 1 && version !== RUN_LEDGER_VERSION)) return undefined;
 	const kind = normalizeKind(raw.kind);
 	const seq = nonnegativeSafeInteger(raw.seq);
 	const ts = finiteNumber(raw.ts);
 	const turn = nonnegativeSafeInteger(raw.turn);
 	if (!kind || seq === undefined || ts === undefined || turn === undefined) return undefined;
-	const base = { v: RUN_LEDGER_VERSION, seq, ts, turn } as const;
+	const base = { v: version as RunLedgerVersion, seq, ts, turn } as const;
 	const clean = (entry: unknown, limit = MAX_SUMMARY_STRING_LENGTH) => truncate(redactTextSecrets(entry), limit);
 	switch (kind) {
 		case "run": {
@@ -462,6 +482,20 @@ export function normalizeRunLedgerEvent(value: unknown): RunLedgerEvent | undefi
 		case "permission": { const status = clean(raw.status, 80) || "pending"; const summary = clean(field(raw, "summary", "title", "message")); return summary || !permissionIsPending(status) ? { ...base, kind, status, summary } : undefined; }
 		case "error": { const message = clean(field(raw, "message", "error")); return message ? { ...base, kind, message, code: clean(raw.code, 80) || undefined } : undefined; }
 		case "completion": { const status = clean(raw.status, 80) || "completed"; return { ...base, kind, status, summary: clean(field(raw, "summary", "message")) || undefined }; }
+		case "metrics": {
+			if (version !== 2 || Object.keys(raw).some((key) => !["v", "version", "seq", "ts", "turn", "kind", "sampledAt", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "cost", "contextUsage", "compactionCount"].includes(key))) return undefined;
+			const sampledAt = nonnegativeSafeInteger(raw.sampledAt), inputTokens = nonnegativeSafeInteger(raw.inputTokens), outputTokens = nonnegativeSafeInteger(raw.outputTokens), cacheReadTokens = nonnegativeSafeInteger(raw.cacheReadTokens), cacheWriteTokens = nonnegativeSafeInteger(raw.cacheWriteTokens), totalTokens = nonnegativeSafeInteger(raw.totalTokens), compactionCount = nonnegativeSafeInteger(raw.compactionCount); const cost = finiteNumber(raw.cost);
+			let contextUsage: MetricsEvent["contextUsage"];
+			if (raw.contextUsage !== undefined) { const context = record(raw.contextUsage); if (!context || Object.keys(context).some((key) => !["tokens", "contextWindow", "percent"].includes(key)) || !Object.prototype.hasOwnProperty.call(context, "tokens") || !Object.prototype.hasOwnProperty.call(context, "contextWindow") || !Object.prototype.hasOwnProperty.call(context, "percent") || (context.tokens !== null && nonnegativeSafeInteger(context.tokens) === undefined) || nonnegativeSafeInteger(context.contextWindow) === undefined || (context.percent !== null && (finiteNumber(context.percent) === undefined || (context.percent as number) < 0))) return undefined; contextUsage = { tokens: context.tokens as number | null, contextWindow: context.contextWindow as number, percent: context.percent as number | null }; }
+			if ([sampledAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, compactionCount].some((entry) => entry === undefined) || cost === undefined || cost < 0) return undefined;
+			return { ...base, kind, sampledAt: sampledAt!, inputTokens: inputTokens!, outputTokens: outputTokens!, cacheReadTokens: cacheReadTokens!, cacheWriteTokens: cacheWriteTokens!, totalTokens: totalTokens!, cost, ...(contextUsage ? { contextUsage } : {}), compactionCount: compactionCount! };
+		}
+		case "compaction": {
+			if (version !== 2 || Object.keys(raw).some((key) => !["v", "version", "seq", "ts", "turn", "kind", "state", "reason", "tokensBefore", "estimatedTokensAfter", "willRetry", "compactionCount"].includes(key)) || !["started", "completed", "aborted", "failed"].includes(String(raw.state)) || (raw.reason !== undefined && !["manual", "threshold", "overflow"].includes(String(raw.reason)))) return undefined;
+			const tokensBefore = raw.tokensBefore === undefined ? undefined : nonnegativeSafeInteger(raw.tokensBefore), estimatedTokensAfter = raw.estimatedTokensAfter === undefined ? undefined : nonnegativeSafeInteger(raw.estimatedTokensAfter), compactionCount = nonnegativeSafeInteger(raw.compactionCount);
+			if (compactionCount === undefined || (raw.tokensBefore !== undefined && tokensBefore === undefined) || (raw.estimatedTokensAfter !== undefined && estimatedTokensAfter === undefined) || (raw.willRetry !== undefined && typeof raw.willRetry !== "boolean")) return undefined;
+			return { ...base, kind, state: raw.state as CompactionEvent["state"], reason: raw.reason as CompactionEvent["reason"], tokensBefore, estimatedTokensAfter, willRetry: raw.willRetry === undefined ? undefined : raw.willRetry, compactionCount };
+		}
 	}
 }
 
@@ -501,7 +535,7 @@ export function parseRunLedgerJsonl(input: string, options: ParseRunLedgerOption
 		try {
 			const parsed: unknown = JSON.parse(line); const event = normalizeRunLedgerEvent(parsed);
 			if (event) allEvents.push(event);
-			else if ((record(parsed)?.v ?? record(parsed)?.version) !== RUN_LEDGER_VERSION) unsupported++;
+			else if (!([1, RUN_LEDGER_VERSION] as unknown[]).includes(record(parsed)?.v ?? record(parsed)?.version)) unsupported++;
 			else malformed++;
 		} catch { if (!(finalPartial && index === lines.length - 1)) malformed++; }
 	}
@@ -520,6 +554,8 @@ export type LedgerTimelineRow = ThoughtRow | ResponseRow | PhaseRow | ToolRow;
 export interface PinnedPermission { ts: number; turn: number; status: string; summary: string; }
 export interface PinnedError { ts: number; turn: number; message: string; code?: string; }
 export interface CompletionState { ts: number; turn: number; status: string; summary?: string; }
+export interface LedgerMetrics { sampledAt: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number; cost: number; contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null }; compactionCount: number; }
+export interface LedgerCompaction { ts: number; turn: number; state: "started" | "completed" | "aborted" | "failed"; reason?: "manual" | "threshold" | "overflow"; tokensBefore?: number; estimatedTokensAfter?: number; willRetry?: boolean; compactionCount: number; }
 export interface RunLedgerState extends RunMetadata {
 	runId?: string;
 	title?: string;
@@ -535,6 +571,8 @@ export interface RunLedgerState extends RunMetadata {
 	permission?: PinnedPermission;
 	error?: PinnedError;
 	completion?: CompletionState;
+	metrics?: LedgerMetrics;
+	compaction?: LedgerCompaction;
 	unknownToolEvents: number;
 }
 
@@ -549,15 +587,24 @@ export interface RunLedgerStateSeed extends RunMetadata {
 	turn?: number;
 	startedAt?: number;
 	lastTs?: number;
+	metrics?: LedgerMetrics;
 }
 
+function cloneSeedMetrics(value: unknown): LedgerMetrics | undefined {
+	const raw = record(value); if (!raw || Object.keys(raw).some((key) => !["sampledAt", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "cost", "contextUsage", "compactionCount"].includes(key))) return undefined;
+	const sampledAt = nonnegativeSafeInteger(raw.sampledAt), inputTokens = nonnegativeSafeInteger(raw.inputTokens), outputTokens = nonnegativeSafeInteger(raw.outputTokens), cacheReadTokens = nonnegativeSafeInteger(raw.cacheReadTokens), cacheWriteTokens = nonnegativeSafeInteger(raw.cacheWriteTokens), totalTokens = nonnegativeSafeInteger(raw.totalTokens), compactionCount = nonnegativeSafeInteger(raw.compactionCount), cost = finiteNumber(raw.cost);
+	if ([sampledAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, compactionCount].some((value) => value === undefined) || cost === undefined || cost < 0) return undefined;
+	let contextUsage: LedgerMetrics["contextUsage"];
+	if (raw.contextUsage !== undefined) { const context = record(raw.contextUsage); if (!context || Object.keys(context).some((key) => !["tokens", "contextWindow", "percent"].includes(key)) || context.tokens === undefined || context.contextWindow === undefined || context.percent === undefined || (context.tokens !== null && nonnegativeSafeInteger(context.tokens) === undefined) || nonnegativeSafeInteger(context.contextWindow) === undefined || (context.percent !== null && (finiteNumber(context.percent) === undefined || (context.percent as number) < 0))) return undefined; contextUsage = { tokens: context.tokens as number | null, contextWindow: context.contextWindow as number, percent: context.percent as number | null }; }
+	return { sampledAt: sampledAt!, inputTokens: inputTokens!, outputTokens: outputTokens!, cacheReadTokens: cacheReadTokens!, cacheWriteTokens: cacheWriteTokens!, totalTokens: totalTokens!, cost, ...(contextUsage ? { contextUsage } : {}), compactionCount: compactionCount! };
+}
 /** Seed the pure reducer from private viewer-info metadata when the run event aged out of a tail. */
 export function createRunLedgerState(seed: RunLedgerStateSeed = {}): RunLedgerState {
 	const clean = (value: unknown, limit = MAX_SUMMARY_STRING_LENGTH) => truncate(redactTextSecrets(value), limit) || undefined;
 	return {
 		runId: clean(seed.runId, 120), title: clean(seed.title, 200), runtimeState: clean(seed.runtimeState, 80), runtimeDetail: clean(seed.runtimeDetail),
 		task: clean(seed.task), agentName: clean(seed.agentName, 120), backend: clean(seed.backend, 80), model: clean(seed.model, 160), thinking: clean(seed.thinking, 80), cwd: clean(seed.cwd, 300),
-		turn: nonnegativeSafeInteger(seed.turn) ?? 0, startedAt: finiteNumber(seed.startedAt), lastTs: finiteNumber(seed.lastTs), timeline: [], tools: new Map(), unknownToolEvents: 0,
+		turn: nonnegativeSafeInteger(seed.turn) ?? 0, metrics: cloneSeedMetrics(seed.metrics), startedAt: finiteNumber(seed.startedAt), lastTs: finiteNumber(seed.lastTs), timeline: [], tools: new Map(), unknownToolEvents: 0,
 	};
 }
 
@@ -620,9 +667,9 @@ export function reduceRunLedger(state: RunLedgerState, event: RunLedgerEvent): R
 		case "permission": return permissionIsPending(event.status) ? { ...base, permission: { ts: event.ts, turn: event.turn, status: event.status, summary: event.summary } } : { ...base, permission: undefined };
 		case "error": return { ...base, error: { ts: event.ts, turn: event.turn, message: event.message, code: event.code } };
 		case "completion":
-			return cleared.completion?.turn === event.turn
-				? base
-				: { ...base, permission: undefined, completion: { ts: event.ts, turn: event.turn, status: event.status, summary: event.summary } };
+			return cleared.completion?.turn === event.turn ? base : { ...base, permission: undefined, completion: { ts: event.ts, turn: event.turn, status: event.status, summary: event.summary } };
+		case "metrics": return { ...base, metrics: { sampledAt: event.sampledAt, inputTokens: event.inputTokens, outputTokens: event.outputTokens, cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens, totalTokens: event.totalTokens, cost: event.cost, ...(event.contextUsage ? { contextUsage: { ...event.contextUsage } } : {}), compactionCount: event.compactionCount } };
+		case "compaction": return { ...base, compaction: { ts: event.ts, turn: event.turn, state: event.state, reason: event.reason, tokensBefore: event.tokensBefore, estimatedTokensAfter: event.estimatedTokensAfter, willRetry: event.willRetry, compactionCount: event.compactionCount } };
 	}
 }
 
@@ -717,7 +764,10 @@ export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerO
 	if (state.permission) fixed.push(line({ role: "warning", text: fit(`Permission · ${state.permission.status} · ${state.permission.summary}`, width) }));
 	if (state.error) fixed.push(line({ role: "error", text: fit(`Error${state.error.code ? ` ${state.error.code}` : ""} · ${state.error.message}`, width) }));
 	if (state.task) fixed.push(line({ role: "task", text: fit(`Task · ${state.task}`, width) }));
-	const metadata = [state.backend, state.model, state.thinking ? `thinking ${state.thinking}` : undefined, state.cwd].filter((value): value is string => !!value).join(" · ");
+	const compactionCount = Math.max(state.metrics?.compactionCount ?? 0, state.compaction?.compactionCount ?? 0);
+	const usage = state.backend === "cursor" ? "usage — · context — · compactions —" : state.metrics ? `usage ${state.metrics.totalTokens} · context ${state.metrics.contextUsage?.tokens ?? "—"} · compactions ${compactionCount}` : state.compaction ? `usage — · context — · compactions ${compactionCount}` : undefined;
+	const compaction = state.backend === "cursor" || !state.compaction ? undefined : `compact ${state.compaction.state}${state.compaction.willRetry ? " · retry" : ""}`;
+	const metadata = [state.backend, state.model, state.thinking ? `thinking ${state.thinking}` : undefined, usage, compaction, state.cwd].filter((value): value is string => !!value).join(" · ");
 	if (metadata) fixed.push(line({ role: "muted", text: fit(metadata, width) }));
 	const reserveFooter = footer ? 1 : 0; const fixedVisible = fixed.slice(0, Math.max(0, height - reserveFooter));
 	const remaining = Math.max(0, height - reserveFooter - fixedVisible.length);

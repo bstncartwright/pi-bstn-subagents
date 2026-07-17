@@ -376,3 +376,21 @@ test("repeated opaque partial results become counts without persisting their tex
 	assert.deepEqual(records.map((record) => record.count), [16, 34]);
 	assert.doesNotMatch(JSON.stringify(records), /token|secret|password|example/i);
 });
+
+test("Pi session stats parser accepts only numeric non-identifying totals", async () => {
+	const { parsePiSessionStats } = await import("../extensions/pi-runtime.ts");
+	const raw = { sessionFile: "/private/session.jsonl", sessionId: "private-session", userMessages: 1, assistantMessages: 2, toolCalls: 3, toolResults: 3, totalMessages: 9, tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, cost: 0.25, contextUsage: { tokens: null, contextWindow: 100, percent: null } };
+	assert.deepEqual(parsePiSessionStats(raw), { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, totalTokens: 10, cost: 0.25, contextUsage: { tokens: null, contextWindow: 100, percent: null } });
+	assert.equal(parsePiSessionStats({ ...raw, sessionId: "" }), undefined);
+	assert.equal(parsePiSessionStats({ ...raw, tokens: { ...raw.tokens, total: Infinity } }), undefined);
+	assert.equal(parsePiSessionStats({ ...raw, contextUsage: undefined })!.contextUsage, undefined);
+});
+
+test("Pi compaction hints use result numbers and never retain textual or identifying payloads", async () => {
+	const { normalizePiCompactionEvent } = await import("../extensions/pi-runtime.ts");
+	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_start", reason: "threshold", summary: "secret" }), { type: "compaction", state: "started", reason: "threshold" });
+	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end", reason: "overflow", willRetry: true, result: { tokensBefore: 99, estimatedTokensAfter: 12, summary: "secret", firstKeptEntryId: "id" }, details: "private" }), { type: "compaction", state: "completed", reason: "overflow", tokensBefore: 99, estimatedTokensAfter: 12, willRetry: true });
+	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end", errorMessage: "private error", result: { tokensBefore: 9 } }), { type: "compaction", state: "failed", tokensBefore: 9 });
+	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end", aborted: true, result: { estimatedTokensAfter: 3 } }), { type: "compaction", state: "aborted", estimatedTokensAfter: 3 });
+	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end" }), { type: "compaction", state: "failed" });
+});

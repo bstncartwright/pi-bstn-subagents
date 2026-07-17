@@ -105,3 +105,12 @@ test("viewer CLI accepts flags, remains import-safe, and launches TypeScript sna
 	assert.match(output, /CLI task/);
 	chmodSync(paths.journal, 0o600);
 });
+
+test("bounded viewer tails retain strict Pi metrics from private info and ignore Cursor debris", () => {
+	const paths = fixture();
+	writeFileSync(paths.info, JSON.stringify({ id: "run", canonicalName: "/Ada", backend: "pi", model: "test", status: "running", startedAt: 1000, turn: 3, metrics: { sampledAt: 2, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0, contextUsage: { tokens: null, contextWindow: 100, percent: null }, compactionCount: 4 } }));
+	writeFileSync(paths.journal, `${"x".repeat(300_000)}\n${journalLine("phase", { name: "tail" }, 99)}\n`);
+	assert.match(renderViewerFrame({ infoPath: paths.info, journalPath: paths.journal, rawLogPath: paths.raw, width: 120, height: 5 }), /usage 3 · context — · compactions 4/);
+	writeFileSync(paths.info, JSON.stringify({ id: "run", canonicalName: "/Cursor", backend: "cursor", model: "Auto", status: "running", startedAt: 1000, turn: 3, metrics: { sampledAt: 2, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0, compactionCount: 4 } }));
+	assert.match(renderViewerFrame({ infoPath: paths.info, journalPath: paths.journal, rawLogPath: paths.raw, width: 120, height: 5 }), /usage — · context — · compactions —/);
+});

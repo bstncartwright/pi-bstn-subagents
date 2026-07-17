@@ -34,7 +34,7 @@ test("manifest parsing is strict, versioned, corrupt-fail-closed, and contains n
 	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
 	assert.deepEqual(parseParentManifest(manifest), manifest);
 	for (const corrupt of [
-		mutateJson(manifest, (value) => { value.version = 2; }),
+		mutateJson(manifest, (value) => { value.version = 3; }),
 		mutateJson(manifest, (value) => { value.extra = true; }),
 		mutateJson(manifest, (value) => { value.turns["turn-a"].sequence = 0.1; }),
 		mutateJson(manifest, (value) => { value.agents[ids[0]].currentTurnId = "missing"; }),
@@ -338,4 +338,15 @@ test("store rejects oversized manifest and lock data before parsing", async () =
 		writeFileSync(join(dir, TURN_MANIFEST_LOCK_FILE), "x".repeat(MAX_LOCK_BYTES + 1), { mode: 0o600 });
 		assert.throws(() => store.acquire("epoch-a"), /exceeds .* bytes before read/);
 	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("v1 upgrades to strict v2 and Pi-only metrics reject Cursor and payload fields", () => {
+	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
+	const v1: any = JSON.parse(JSON.stringify(manifest)); v1.version = 1;
+	const upgraded = parseParentManifest(v1);
+	assert.equal(upgraded.version, 2);
+	assert.throws(() => parseParentManifest({ ...v1, agents: { ...v1.agents, [ids[0]!]: { ...v1.agents[ids[0]!], metrics: {} } } }), /v1 manifest/);
+	const metrics = { sampledAt: now, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0, contextUsage: { tokens: null, contextWindow: 100, percent: null }, compactionCount: 1 };
+	assert.doesNotThrow(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics } } }));
+	assert.throws(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics: { ...metrics, sessionId: "forbidden" } } } }), /unsupported/);
 });

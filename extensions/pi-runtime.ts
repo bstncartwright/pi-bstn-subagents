@@ -4,9 +4,34 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
-import type { PiRuntimeAgent } from "./unified-deps.ts";
+import type { PiRuntimeAgent, PiSessionStats } from "./unified-deps.ts";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+function statsNumber(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined; }
+function statsInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined; }
+function statsCount(value: unknown): boolean { return statsInteger(value) !== undefined; }
+/** Strictly validate Pi's documented full stats response while retaining only numeric usage. */
+export function parsePiSessionStats(value: unknown): PiSessionStats | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	const allowed = ["sessionFile", "sessionId", "userMessages", "assistantMessages", "toolCalls", "toolResults", "totalMessages", "tokens", "cost", "contextUsage"];
+	if (Object.keys(raw).some((key) => !allowed.includes(key)) || typeof raw.sessionId !== "string" || !raw.sessionId || (raw.sessionFile !== undefined && typeof raw.sessionFile !== "string") || ![raw.userMessages, raw.assistantMessages, raw.toolCalls, raw.toolResults, raw.totalMessages].every(statsCount)) return undefined;
+	if (!raw.tokens || typeof raw.tokens !== "object" || Array.isArray(raw.tokens)) return undefined;
+	const tokens = raw.tokens as Record<string, unknown>;
+	if (Object.keys(tokens).some((key) => !["input", "output", "cacheRead", "cacheWrite", "total"].includes(key))) return undefined;
+	const inputTokens = statsInteger(tokens.input), outputTokens = statsInteger(tokens.output), cacheReadTokens = statsInteger(tokens.cacheRead), cacheWriteTokens = statsInteger(tokens.cacheWrite), totalTokens = statsInteger(tokens.total), cost = statsNumber(raw.cost);
+	if ([inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, cost].some((entry) => entry === undefined)) return undefined;
+	let contextUsage: PiSessionStats["contextUsage"];
+	if (raw.contextUsage !== undefined) {
+		if (!raw.contextUsage || typeof raw.contextUsage !== "object" || Array.isArray(raw.contextUsage)) return undefined;
+		const context = raw.contextUsage as Record<string, unknown>;
+		if (Object.keys(context).some((key) => !["tokens", "contextWindow", "percent"].includes(key)) || !Object.prototype.hasOwnProperty.call(context, "tokens") || !Object.prototype.hasOwnProperty.call(context, "contextWindow") || !Object.prototype.hasOwnProperty.call(context, "percent")) return undefined;
+		if ((context.tokens !== null && statsInteger(context.tokens) === undefined) || statsInteger(context.contextWindow) === undefined || (context.percent !== null && statsNumber(context.percent) === undefined)) return undefined;
+		contextUsage = { tokens: context.tokens as number | null, contextWindow: context.contextWindow as number, percent: context.percent as number | null };
+	}
+	return { inputTokens: inputTokens!, outputTokens: outputTokens!, cacheReadTokens: cacheReadTokens!, cacheWriteTokens: cacheWriteTokens!, totalTokens: totalTokens!, cost: cost!, ...(contextUsage ? { contextUsage } : {}) };
+}
+
 
 export class JsonlDecoder {
 	private readonly decoder = new StringDecoder("utf8");
@@ -45,6 +70,20 @@ function stableString(value: unknown): string | undefined {
 }
 function own(object: Record<string, unknown> | undefined, key: string): unknown {
 	return object && Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+}
+function compactionReason(value: unknown): "manual" | "threshold" | "overflow" | undefined { return value === "manual" || value === "threshold" || value === "overflow" ? value : undefined; }
+export type PiCompactionHint = { type: "compaction"; state: "started" | "completed" | "aborted" | "failed"; reason?: "manual" | "threshold" | "overflow"; tokensBefore?: number; estimatedTokensAfter?: number; willRetry?: boolean };
+/** Extract the only safe compaction lifecycle fields from Pi RPC notifications. */
+export function normalizePiCompactionEvent(value: unknown): PiCompactionHint | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const event = value as Record<string, unknown>; const reason = compactionReason(event.reason);
+	if (event.type === "auto_compaction_start" || event.type === "compaction_start") return { type: "compaction", state: "started", ...(reason ? { reason } : {}) };
+	if (event.type !== "auto_compaction_end" && event.type !== "compaction_end") return undefined;
+	const result = event.result && typeof event.result === "object" && !Array.isArray(event.result) ? event.result as Record<string, unknown> : undefined;
+	const tokensBefore = statsInteger(result?.tokensBefore), estimatedTokensAfter = statsInteger(result?.estimatedTokensAfter);
+	const validResult = !!result && tokensBefore !== undefined && estimatedTokensAfter !== undefined;
+	const state = event.aborted === true || result?.aborted === true ? "aborted" : typeof event.errorMessage === "string" || typeof result?.errorMessage === "string" || !validResult ? "failed" : "completed";
+	return { type: "compaction", state, ...(reason ? { reason } : {}), ...(tokensBefore === undefined ? {} : { tokensBefore }), ...(estimatedTokensAfter === undefined ? {} : { estimatedTokensAfter }), ...(typeof event.willRetry === "boolean" ? { willRetry: event.willRetry } : {}) };
 }
 
 /** Preserve Pi RPC lifecycle fields verbatim until the journal boundary summarizes them. */
@@ -140,6 +179,12 @@ export class PiRpcClient {
 		await this.command({ type: "get_state" });
 	}
 
+	async getSessionStats(): Promise<PiSessionStats> {
+		const parsed = parsePiSessionStats(await this.command({ type: "get_session_stats" }));
+		if (!parsed) throw new Error("Child Pi returned malformed session stats.");
+		return parsed;
+	}
+
 	async prompt(message: string, turnToken?: string): Promise<void> {
 		this.activeTurnToken = turnToken;
 		this.candidateResponse = "";
@@ -211,8 +256,11 @@ export class PiRpcClient {
 		const toolEvent = normalizePiRpcToolEvent(event);
 		if (toolEvent) this.emit(toolEvent);
 		if (event.type === "auto_retry_start") this.emit({ type: "phase", phase: "Retrying" });
-		if (event.type === "auto_compaction_start" || event.type === "compaction_start") this.emit({ type: "phase", phase: "Compacting" });
+		const compaction = normalizePiCompactionEvent(event);
+		if (compaction?.state === "started") this.emit({ type: "phase", phase: "Compacting" });
+		if (compaction) this.emit(compaction);
 		if (event.type === "message_end" && event.message?.role === "assistant") {
+			this.emit({ type: "metrics_hint" });
 			this.candidateResponse = messageText(event.message);
 			this.candidateError = ["error", "aborted"].includes(event.message.stopReason)
 				? event.message.errorMessage || `Pi subagent ended with ${event.message.stopReason}.`
@@ -228,7 +276,7 @@ export class PiRpcClient {
 			}
 		}
 		if (event.type === "auto_retry_end" && event.success === false) this.candidateError = event.finalError || "Pi retry failed.";
-		if (event.type === "agent_settled") { this.emit({ type: "settled", output: this.candidateResponse, error: this.candidateError }); this.activeTurnToken = undefined; }
+		if (event.type === "agent_settled") { this.emit({ type: "metrics_hint" }); this.emit({ type: "settled", output: this.candidateResponse, error: this.candidateError }); this.activeTurnToken = undefined; }
 	}
 
 	private emit(event: any): void { this.onEvent(event, this.activeTurnToken); }

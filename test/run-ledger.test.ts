@@ -333,3 +333,15 @@ test("medium and narrow exact snapshots preserve sticky identity and do not expo
 	assert.equal(renderRunLedgerText(renderRunLedger(state, { width: 80, height: 8, now: at + 20_000 })), `RUN Ada · completed · 0:11 · T2\nError EACCES · Denied once\nTask · Implement the ledger renderer\npi · gpt-test · thinking high · /work\n+4.0s Tool · ✓ bash · npm test · completed · 2.0s · text output · 11 chars\n+7.0s Response · This response is intentionally long enough to wrap across sever\n  ↳ al semantic lines.\nCompleted · completed · success`);
 	assert.equal(renderRunLedgerText(renderRunLedger(state, { width: 40, height: 6, now: at + 20_000 })), `Ada · completed · 0:11 · T2\nError EACCES · Denied once\nTask · Implement the ledger renderer\npi · gpt-test · thinking high · /work\n+7.0s Response · This response is intent\nCompleted · completed · success`);
 });
+
+test("v2 metrics and compaction records reject identifiers and render Cursor availability honestly", () => {
+	const metrics = normalizeRunLedgerEvent({ v: 2, seq: 1, ts: at, turn: 1, kind: "metrics", sampledAt: at, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0.1, contextUsage: { tokens: null, contextWindow: 100, percent: null }, compactionCount: 4 });
+	const compact = normalizeRunLedgerEvent({ v: 2, seq: 2, ts: at + 1, turn: 1, kind: "compaction", state: "completed", reason: "overflow", tokensBefore: 10, estimatedTokensAfter: 4, compactionCount: 4 });
+	assert.equal(normalizeRunLedgerEvent({ v: 2, seq: 3, ts: at, turn: 1, kind: "compaction", state: "end", compactionCount: 4 }), undefined);
+	assert.ok(metrics); assert.ok(compact);
+	assert.equal(normalizeRunLedgerEvent({ ...(metrics as any), sessionId: "never" }), undefined);
+	const pi = renderRunLedgerText(renderRunLedger(reduceRunLedgerEvents([metrics!, compact!]), { width: 100, height: 3 }));
+	assert.match(pi, /usage 3 .* context — .* compactions 4/);
+	const cursor = renderRunLedgerText(renderRunLedger(reduceRunLedgerEvents([normalizeRunLedgerEvent({ v: 2, seq: 1, ts: at, turn: 1, kind: "run", runId: "c", backend: "cursor" })!]), { width: 100, height: 2 }));
+	assert.match(cursor, /usage — .* context — .* compactions —/);
+});
