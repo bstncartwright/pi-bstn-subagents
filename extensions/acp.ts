@@ -62,8 +62,8 @@ export interface JsonRpcMessage {
 }
 
 export interface AcpHandlers {
-	onNotification?: (message: JsonRpcMessage) => void;
-	onRequest?: (message: JsonRpcMessage) => Promise<unknown> | unknown;
+	onNotification?: (message: JsonRpcMessage, turnToken?: string) => void;
+	onRequest?: (message: JsonRpcMessage, turnToken?: string) => Promise<unknown> | unknown;
 	onStderr?: (text: string) => void;
 	onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
 }
@@ -133,6 +133,7 @@ export class CursorAcpClient {
 	private pending = new Map<number | string, PendingRequest>();
 	private closed = false;
 	private sessionId?: string;
+	private activeTurnToken?: string;
 
 	constructor(cwd: string, options: CursorAcpClientOptions = {}) {
 		this.cwd = cwd;
@@ -231,16 +232,11 @@ export class CursorAcpClient {
 		};
 	}
 
-	async prompt(text: string): Promise<{ stopReason?: string }> {
+	async prompt(text: string, turnToken?: string): Promise<{ stopReason?: string }> {
+		this.activeTurnToken = turnToken;
 		if (!this.sessionId) throw new Error("Cursor ACP session is not initialized.");
-		return this.request(
-			"session/prompt",
-			{
-				sessionId: this.sessionId,
-				prompt: [{ type: "text", text }],
-			},
-			0,
-		);
+		try { return await this.request("session/prompt", { sessionId: this.sessionId, prompt: [{ type: "text", text }] }, 0); }
+		finally { this.activeTurnToken = undefined; }
 	}
 
 	cancel(): void {
@@ -347,13 +343,13 @@ export class CursorAcpClient {
 		}
 
 		if (message.method && message.id !== undefined) {
-			Promise.resolve(this.handlers.onRequest?.(message))
+			Promise.resolve(this.handlers.onRequest?.(message, this.activeTurnToken))
 				.then((result) => this.respond(message.id!, result ?? {}))
 				.catch((error) => this.respondError(message.id!, -32603, error?.message ?? String(error)));
 			return;
 		}
 
-		if (message.method) this.handlers.onNotification?.(message);
+		if (message.method) this.handlers.onNotification?.(message, this.activeTurnToken);
 	}
 
 	private rejectAll(error: Error): void {

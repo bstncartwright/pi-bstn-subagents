@@ -11,6 +11,9 @@ export interface MailEvent<Status extends string = string> {
 	summary?: string;
 	allowOnceOffered?: boolean;
 	createdAt: number;
+	/** Stable manifest turn identity; prevents stale completion delivery. */
+	turnId?: string;
+	terminalReason?: string;
 }
 
 export interface PermissionMailKey {

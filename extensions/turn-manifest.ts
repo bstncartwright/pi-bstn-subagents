@@ -350,12 +350,14 @@ export function validateManifest(manifest: ParentManifestV1): void {
 	if (manifest.version !== TURN_MANIFEST_VERSION) fail("version is unsupported");
 	assert(Object.keys(manifest.agents).length <= MAX_MANIFEST_AGENTS, "manifest.agents exceeds bound");
 	assert(Object.keys(manifest.turns).length <= MAX_MANIFEST_TURNS, "manifest.turns exceeds bound");
-	const ids = new Set<string>(); const sequences = new Set<number>(); const activeTurns: ManifestTurn[] = []; const perAgent = new Map<string, ManifestTurn[]>();
+	const ids = new Set<string>(); const taskNames = new Set<string>(); const canonicalNames = new Set<string>(); const sequences = new Set<number>(); const activeTurns: ManifestTurn[] = []; const perAgent = new Map<string, ManifestTurn[]>();
 	for (const [key, agent] of Object.entries(manifest.agents)) {
 		assert(key === agent.id, `agent key ${key} does not match id`); opaqueId(agent.id, `agent ${agent.id}.id`); assert(!ids.has(agent.id), `duplicate agent ${agent.id}`); ids.add(agent.id);
 		assert(agent.parentSessionId === manifest.parentSessionId, `agent ${agent.id} has another parent session`);
 		assert(/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(agent.taskName), `agent ${agent.id} taskName must use normalized public task syntax`);
 		assert(agent.canonicalName === `/${agent.taskName}`, `agent ${agent.id} canonicalName must equal /taskName`);
+		assert(!taskNames.has(agent.taskName), `duplicate taskName ${agent.taskName}`); taskNames.add(agent.taskName);
+		assert(!canonicalNames.has(agent.canonicalName), `duplicate canonicalName ${agent.canonicalName}`); canonicalNames.add(agent.canonicalName);
 		const pathBase = `${resolve(agent.infoFile).slice(0, -".info.json".length)}`;
 		assert(resolve(agent.infoFile) === agent.infoFile && agent.infoFile === `${pathBase}.info.json` && agent.logFile === `${pathBase}.events.log` && agent.responseFile === `${pathBase}.response.txt` && pathBase.endsWith(`/${agent.id}`), `agent ${agent.id} resource paths must be direct canonical agent paths`);
 		assert(agent.backend === "pi" ? resolve(agent.sessionFile ?? "") === `${pathBase}.session.jsonl` : agent.sessionFile === undefined, `agent ${agent.id} has invalid backend session path`);
@@ -520,13 +522,19 @@ export function replaceCursorTurn(manifest: ParentManifestV1, oldTurnId: string,
 	next.turns[successorId] = successor; agent.currentTurnId = successorId; agent.updatedAt = now; next.updatedAt = now; validateManifest(next); return next;
 }
 
-export function admitFifo(manifest: ParentManifestV1, now: number, limit = DEFAULT_ACTIVE_TURN_LIMIT): { manifest: ParentManifestV1; admitted: string[] } {
+export function admitFifo(manifest: ParentManifestV1, now: number, limit = DEFAULT_ACTIVE_TURN_LIMIT, eligible: (turn: ManifestTurn) => boolean = () => true): { manifest: ParentManifestV1; admitted: string[] } {
 	if (!Number.isSafeInteger(limit) || limit < 1 || limit > DEFAULT_ACTIVE_TURN_LIMIT) fail(`admission limit must be a positive safe integer no greater than ${DEFAULT_ACTIVE_TURN_LIMIT}`);
 	assertMutationTime(manifest, now);
 	let next = clone(manifest); const active = Object.values(next.turns).filter((turn) => turn.state === "admitted" || turn.state === "running").length;
-	const slots = Math.max(0, limit - active); const queued = Object.values(next.turns).filter((turn) => turn.state === "queued").sort((a, b) => a.sequence - b.sequence).slice(0, slots);
-	for (const turn of queued) next = transitionTurn(next, turn.id, "admitted", now);
-	return { manifest: next, admitted: queued.map((turn) => turn.id) };
+	const slots = Math.max(0, limit - active);
+	const prefix: ManifestTurn[] = [];
+	for (const turn of Object.values(next.turns).filter((turn) => turn.state === "queued").sort((a, b) => a.sequence - b.sequence)) {
+		// FIFO is a strict prefix: an unprepared older turn blocks younger work.
+		if (!eligible(turn) || prefix.length >= slots) break;
+		prefix.push(turn);
+	}
+	for (const turn of prefix) next = transitionTurn(next, turn.id, "admitted", now);
+	return { manifest: next, admitted: prefix.map((turn) => turn.id) };
 }
 
 export function reconcileManifest(manifest: ParentManifestV1, newEpoch: string, now: number): ParentManifestV1 {

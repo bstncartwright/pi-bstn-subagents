@@ -147,18 +147,19 @@ Persisted metadata and UI continue to display Pi models as `provider:modelId`.
 
 ## Workflow
 
-`spawn_agent` returns after the child starts and accepts its task:
+`spawn_agent` durably queues a turn before any child runtime starts. A Herdr viewer appears immediately, including while queued:
 
 1. Use `list_subagent_models` before choosing any non-inherited model.
-2. Spawn one or more agents.
-3. Continue independent parent work if useful.
-4. Call `wait_agent` or `wait_all_agents` when a result must block the current workflow.
-5. Use `send_message` for follow-up work.
-6. Call `close_agent` when the session is no longer needed.
+2. Spawn one or more agents. Each result includes `status: "queued"` and a stable `turn_id`.
+3. The scheduler admits FIFO work with at most **four active turns per parent session**; a different parent session has its own four slots.
+4. Continue independent parent work while queued work starts when a slot opens.
+5. Call `wait_agent` or `wait_all_agents` when a result must block the current workflow. A queued target remains pending.
+6. Use `send_message` for follow-up work. Settled work queues a new turn; sends to queued/admitted turns reject. Pi steers an active turn, while Cursor cancels it and transfers its active slot to a distinct corrective turn.
+7. Call `close_agent` when the session is no longer needed.
 
 Wait tools have no model-facing timeout and honor cancellation of their tool call. Never tell the parent model to sleep or poll. If no active wait consumes a completion, the extension automatically delivers the result as a Pi `followUp` message and triggers a parent turn. An active wait receives the event directly instead, avoiding duplicate delivery. Cursor permission requests use the same rule.
 
-Completed, failed, or interrupted subagents remain available for follow-up work for 15 minutes. Starting another turn resets that window; after 15 idle minutes the backend process and Herdr viewer close automatically while persisted result history remains available.
+Completed, failed, interrupted, or reload-paused subagents remain available for follow-up work for 15 minutes. A reload never resumes old work: queued turns become `paused` (`shutdown-paused`) and admitted/running turns become interrupted. Send an explicit new message to queue fresh work. Starting another turn resets that window; after 15 idle minutes the backend process and Herdr viewer close automatically while persisted result history remains available.
 
 ### Cursor permissions
 
@@ -188,14 +189,15 @@ Runtime data is stored under:
 ├── config.json
 ├── agents/*.md
 └── runs/<parent-session-hash>/
-    ├── <id>.info.json
+    ├── queue.manifest.json   # private canonical agent/turn scheduler state
+    ├── <id>.info.json        # regenerated compatibility projection; never authoritative
     ├── <id>.events.log       # raw, legacy-compatible event transcript
     ├── <id>.viewer.jsonl     # private (0600) bounded semantic Run Ledger
     ├── <id>.response.txt
     └── <id>.session.jsonl   # Pi backend
 ```
 
-Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
+The private manifest is the sole lifecycle authority. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
 
 Optional `config.json`:
 
@@ -259,7 +261,7 @@ Every newly created backend gets a background Herdr **Run Ledger** viewer tab. T
 - The persistent editor widget uses the same two-line format and elapsed runtime, retaining the `[pi]`/`[cursor]` backend prefix. Pi metadata shows `model · thinking <level> · status · elapsed` (or `thinking unknown` for legacy records); Cursor metadata omits thinking. Activity phases include `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
 - In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.
 
-The parent Herdr pane remains `working` while either backend has an outstanding turn.
+The parent Herdr pane remains `working` while its attached parent manifest has queued, admitted, or running work. It releases only when that parent has no outstanding turn.
 
 ## Security
 

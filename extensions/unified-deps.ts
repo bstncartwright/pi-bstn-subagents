@@ -45,7 +45,7 @@ export interface HerdrAgent {
 
 export interface PiRuntime {
 	start(): Promise<void>;
-	prompt(message: string): Promise<void>;
+	prompt(message: string, turnToken?: string): Promise<void>;
 	steer(message: string): Promise<void>;
 	abort(): Promise<void>;
 	close(): Promise<void>;
@@ -53,7 +53,7 @@ export interface PiRuntime {
 
 export interface CursorRuntime {
 	start(model: CursorModel, options?: { sessionId?: string }): Promise<StartedAcpSession>;
-	prompt(message: string): Promise<{ stopReason?: string }>;
+	prompt(message: string, turnToken?: string): Promise<{ stopReason?: string }>;
 	cancel(): void;
 	close(): Promise<void>;
 }
@@ -71,7 +71,7 @@ export interface AgentStateSnapshot {
 	backend: "pi" | "cursor";
 	model: string;
 	thinking?: string;
-	status: "starting" | "running" | "completed" | "failed" | "interrupted" | "closed";
+	status: "queued" | "starting" | "running" | "completed" | "failed" | "interrupted" | "paused" | "closed";
 	createdAt: number;
 	updatedAt: number;
 	startedAt?: number;
@@ -103,10 +103,10 @@ export interface UnifiedSubagentDependencies {
 	paths?: Partial<UnifiedStoragePaths>;
 	commandRunner?: CommandRunner;
 	herdr?: HerdrOperations;
-	createPiRuntime?: (info: PiRuntimeAgent, handlers: { onEvent(event: unknown): void; onExit(error?: Error): void }) => PiRuntime;
+	createPiRuntime?: (info: PiRuntimeAgent, handlers: { onEvent(event: unknown, turnToken?: string): void; onExit(error?: Error): void }) => PiRuntime;
 	createCursorRuntime?: (cwd: string, handlers: {
-		onNotification(message: JsonRpcMessage): void;
-		onRequest(message: JsonRpcMessage): Promise<unknown>;
+		onNotification(message: JsonRpcMessage, turnToken?: string): void;
+		onRequest(message: JsonRpcMessage, turnToken?: string): Promise<unknown>;
 		onStderr(text: string): void;
 		onExit(code: number | null, signal: NodeJS.Signals | null): void;
 	}) => CursorRuntime;

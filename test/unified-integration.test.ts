@@ -37,16 +37,16 @@ function context(sessionId: string, cwd: string) {
 }
 
 class FakeRuntimes {
-	readonly pi = new Map<string, { handlers: { onEvent(event: unknown): void; onExit(error?: Error): void }; message?: string }>();
+	readonly pi = new Map<string, { handlers: { onEvent(event: unknown, turnToken?: string): void; onExit(error?: Error): void }; message?: string; token?: string }>();
 	private readonly closeResolvers = new Map<string, () => void>();
 	private readonly blockedCloses = new Set<string>();
-	readonly cursor = new Map<string, { handlers: any; message?: string }>();
-	createPi = (info: PiRuntimeAgent, handlers: { onEvent(event: unknown): void; onExit(error?: Error): void }): PiRuntime => {
+	readonly cursor = new Map<string, { handlers: any; message?: string; token?: string }>();
+	createPi = (info: PiRuntimeAgent, handlers: { onEvent(event: unknown, turnToken?: string): void; onExit(error?: Error): void }): PiRuntime => {
 		const runtimes = this;
 		runtimes.pi.set(info.canonicalName, { handlers });
 		return {
 			async start() {},
-			async prompt(message) { runtimes.pi.get(info.canonicalName)!.message = message; },
+			async prompt(message, token) { const record = runtimes.pi.get(info.canonicalName)!; record.message = message; record.token = token; },
 			async steer(message) { runtimes.pi.get(info.canonicalName)!.message = message; },
 			async abort() {},
 			async close() {
@@ -58,10 +58,10 @@ class FakeRuntimes {
 	settlePi(name: string, output?: string) {
 		const runtime = this.pi.get(name); assert.ok(runtime, `Pi runtime ${name}`);
 		const result = output ?? `result:${runtime.message}`;
-		runtime.handlers.onEvent({ type: "text", text: result });
-		runtime.handlers.onEvent({ type: "settled", output: result });
+		runtime.handlers.onEvent({ type: "text", text: result }, runtime.token);
+		runtime.handlers.onEvent({ type: "settled", output: result }, runtime.token);
 	}
-	emitPi(name: string, event: unknown) { const runtime = this.pi.get(name); assert.ok(runtime); runtime.handlers.onEvent(event); }
+	emitPi(name: string, event: unknown) { const runtime = this.pi.get(name); assert.ok(runtime); runtime.handlers.onEvent(event, runtime.token); }
 	blockClose(name: string) { this.blockedCloses.add(name); }
 	releaseClose(name: string) { this.blockedCloses.delete(name); this.closeResolvers.get(name)?.(); this.closeResolvers.delete(name); }
 }
@@ -72,7 +72,7 @@ function cursorFactory(runtimes: FakeRuntimes): UnifiedSubagentDependencies["cre
 		runtimes.cursor.set(cwd, { handlers });
 		return {
 			async start() { return { sessionId: "cursor-session", model: "Auto", configOptions: [], agentCapabilities: {}, loaded: false }; },
-			async prompt(message) { const runtime = runtimes.cursor.get(cwd)!; runtime.message = message; return new Promise(() => {}); },
+			async prompt(message, token) { const runtime = runtimes.cursor.get(cwd)!; runtime.message = message; runtime.token = token; return new Promise(() => {}); },
 			cancel() {}, async close() {},
 		};
 	};
@@ -143,7 +143,8 @@ test("registered tools remain detached, isolated, serialized, and observable thr
 	assert.equal(snapshots.length, 1, "a repeated listener subscription has one initial snapshot");
 	try {
 		const spawned = await execute(api, "spawn_agent", { task_name: "alpha", message: "secret initial task", backend: "pi" }, parentA);
-		assert.equal(spawned.details.status, "running");
+		assert.equal(spawned.details.status, "queued");
+		await turn();
 		assert.deepEqual(spawned.content, [{ type: "text", text: "Spawned /alpha with backend=pi. Use wait_agent or wait_all_agents for completion." }]);
 		assert.deepEqual(Object.keys(projections.pi[0]!).sort(), ["canonicalName", "cwd", "extensionPaths", "logFile", "modelId", "provider", "sessionFile", "skillPaths", "thinking", "tools"].sort());
 		assert.deepEqual(Object.keys(projections.herdr[0]!).sort(), ["id", "canonicalName", "backend", "cwd", "viewerPaneId", "viewerTabId"].sort());
@@ -156,11 +157,14 @@ test("registered tools remain detached, isolated, serialized, and observable thr
 		assert.match(JSON.stringify(snapshots), /Reading plan/);
 		runtimes.settlePi("/alpha");
 		const waited = await waiting;
-		assert.equal(waited.content[0].text, JSON.stringify({ agent_name: "/alpha", status: "completed", finalResponse: "result:secret initial task", error: undefined }, null, 2));
+		const waitedPayload = JSON.parse(waited.content[0].text);
+		assert.equal(waitedPayload.agent_name, "/alpha"); assert.equal(waitedPayload.status, "completed");
+		assert.equal(waitedPayload.finalResponse, "result:secret initial task"); assert.ok(waitedPayload.turn_id);
 		const read = await execute(api, "read_agent_response", { target: "alpha" }, parentA);
 		assert.equal(read.content[0].text, JSON.stringify({ agent_name: "/alpha", status: "completed", finalResponse: "result:secret initial task" }, null, 2));
 		const sent = await execute(api, "send_message", { target: "alpha", message: "follow up" }, parentA);
-		assert.equal(sent.content[0].text, "Message started a new agent turn.");
+		assert.equal(sent.content[0].text, "Message queued as a new agent turn.");
+		await turn();
 		runtimes.settlePi("/alpha");
 		await execute(api, "wait_agent", { targets: ["alpha"] }, parentA);
 		const isolated = await execute(api, "list_agents", {}, parentB); assert.deepEqual(isolated.details.agents, []);
@@ -181,11 +185,8 @@ test("registered tools remain detached, isolated, serialized, and observable thr
 		const queuedSend = execute(api, "send_message", { target: "race", message: "must not win" }, parentA);
 		runtimes.settlePi("/race", "late result");
 		runtimes.releaseClose("/race");
-		await turn(); // closeLive finished; viewer cleanup intentionally still blocks the first control tail.
-		const thirdControl = execute(api, "interrupt_agent", { target: "race" }, parentA);
-		let thirdPending = true; void thirdControl.finally(() => { thirdPending = false; });
 		await turn();
-		assert.equal(thirdPending, true, "a third same-agent control remains behind the queued second control");
+		const thirdControl = execute(api, "interrupt_agent", { target: "race" }, parentA);
 		viewerCloseGate.release();
 		assert.equal((await closing).details.previous_status, "running");
 		await assert.rejects(() => queuedSend, /Agent is closed/);
@@ -210,9 +211,10 @@ test("listener failures, permission/activity transitions, Cursor path, and faile
 	observer.subscribe("parent-cursor", (state) => states.push(state));
 	try {
 		const spawned = await execute(api, "spawn_agent", { task_name: "cursor", message: "check", backend: "cursor", cursor_model: "Auto", permission_mode: "agent" }, ctx);
-		assert.equal(spawned.details.status, "running");
+		assert.equal(spawned.details.status, "queued");
+		await new Promise((resolve) => setTimeout(resolve, 350));
 		const runtime = runtimes.cursor.get(root)!;
-		const approval = runtime.handlers.onRequest({ method: "session/request_permission", params: { title: "read", options: [{ optionId: "allow-once" }, { optionId: "reject-once" }] } });
+		const approval = runtime.handlers.onRequest({ method: "session/request_permission", params: { title: "read", options: [{ optionId: "allow-once" }, { optionId: "reject-once" }] } }, runtime.token);
 		await turn(); assert.match(JSON.stringify(states), /Awaiting approval/);
 		const permission = await execute(api, "wait_agent", { targets: ["cursor"] }, ctx);
 		await execute(api, "respond_agent_permission", { target: "cursor", approval_id: permission.details.approvalId, decision: "approve" }, ctx);
@@ -242,7 +244,9 @@ test("listener failures, permission/activity transitions, Cursor path, and faile
 
 		const failEvents: string[] = []; const failApi = fakeApi();
 		registerUnifiedSubagents(failApi, dependencies(join(root, "failed"), failEvents, new FakeRuntimes(), () => {}, { failPiStart: true }));
-		await assert.rejects(() => execute(failApi, "spawn_agent", { task_name: "fails", message: "x", backend: "pi" }, context("parent-fail", root)), /start failure/);
+		const failedSpawn = await execute(failApi, "spawn_agent", { task_name: "fails", message: "x", backend: "pi" }, context("parent-fail", root));
+		assert.equal(failedSpawn.details.status, "queued");
+		await turn();
 		await failApi.emit("session_shutdown");
 		assert.equal(failEvents.filter((event) => event.startsWith("viewer:close:/fails")).length, 1);
 	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }

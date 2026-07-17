@@ -26,6 +26,7 @@ import {
 	taskStorageKey,
 } from "../extensions/unified.ts";
 import { resolveAutomaticPermission } from "../extensions/helpers.ts";
+import { normalizeRunLedgerEvent } from "../extensions/run-ledger.ts";
 
 test("unified JSONL framing preserves Unicode line separators", () => {
 	const decoder = new JsonlDecoder();
@@ -232,50 +233,13 @@ test("Pi ignores cursor_model, including invalid values, for compatibility", () 
 	assert.equal(resolveCursorSpawnModel("pi", "invalid", { cursorModel: "Grok 4.5 High" }), undefined);
 });
 
-test("focused tool contract requires an explicit backend and keeps Cursor on ACP", async () => {
-	const { readFile } = await import("node:fs/promises");
-	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
-	for (const tool of [
-		"spawn_agent",
-		"list_subagent_models",
-		"wait_agent",
-		"wait_all_agents",
-		"list_agents",
-		"read_agent_response",
-		"send_message",
-		"interrupt_agent",
-		"close_agent",
-		"respond_agent_permission",
-	]) assert.match(source, new RegExp(`name: "${tool}"`));
-	assert.match(source, /backend: Backend/);
-	assert.doesNotMatch(source, /backend:\s*Type\.Optional\(Backend\)/);
-	assert.match(source, /pi_model: Type\.Optional\(Type\.String/);
-	assert.match(source, /pi_thinking: Type\.Optional\(PiThinkingSchema\)/);
-	assert.match(source, /cursor_model: Type\.Optional\(Type\.String\(\{ description: "Cursor model string\. Use list_subagent_models for exact supported values\." \}\)\)/);
-	assert.doesNotMatch(source, /CURSOR_MODEL_IDS/);
-	assert.match(source, /const cursorModel = resolveCursorSpawnModel\(params\.backend, params\.cursor_model, template\);[\s\S]*await this\.ensurePrerequisites\(params\.backend, cwd\)/);
-	assert.match(source, /backend: Type\.Optional\(Type\.String/);
-	assert.match(source, /offset: Type\.Optional\(Type\.Integer\(\{ minimum: 0/);
-	assert.match(source, /limit: Type\.Optional\(Type\.Integer\(\{ minimum: 1, maximum: 100/);
-	assert.match(source, /listSubagentModels\(ctx, params\)/);
-	assert.match(source, /subagentModelToolResult\(catalog\)/);
-	assert.match(source, /ctx\.modelRegistry\.find\(provider, modelId\)/);
-	assert.match(source, /model: piSelection \? `\$\{piSelection\.provider\}:\$\{piSelection\.modelId\}` : cursorModel/);
-	assert.match(source, /\.\.\.\(piSelection \? \{[\s\S]*provider: piSelection\.provider,[\s\S]*modelId: piSelection\.modelId,[\s\S]*thinking: piSelection\.thinking,[\s\S]*\} : \{\}\)/);
-	assert.match(source, /new CursorAcpClient/);
-	const acpSource = await readFile(new URL("../extensions/acp.ts", import.meta.url), "utf8");
-	assert.match(acpSource, /session\/load/);
-	assert.match(acpSource, /export const CURSOR_MODEL_IDS/);
-	assert.match(acpSource, /const preset = CURSOR_MODEL_PRESETS\[model\]/);
-	assert.match(source, /isCursorModel\(frontmatter\.cursor_model\)/);
-	assert.match(source, /DEFAULT_CURSOR_MODEL/);
-	assert.doesNotMatch(source, /sendAsyncMessage\(/);
-	assert.match(source, /deliverAs: "followUp"/);
-	assert.match(source, /observedByWaitAll/);
-	assert.match(source, /registerCommand\("subagent"/);
-	const entrySource = await readFile(new URL("../extensions/index.ts", import.meta.url), "utf8");
-	assert.doesNotMatch(entrySource, /name:\s*"subagent"/);
-	assert.doesNotMatch(entrySource, /Legacy Cursor Subagent/);
+test("current scheduler contract keeps explicit backend/model resolution and opaque runtime selection", () => {
+	// Tool registration and lifecycle behavior are exercised through the controlled integration
+	// harness. Keep this unit-level contract on public selection behavior rather than source regexes.
+	assert.deepEqual(parsePiModel("provider/model"), { provider: "provider", modelId: "model" });
+	assert.equal(resolveCursorSpawnModel("cursor", undefined), "Auto");
+	assert.throws(() => validateSpawnPiOptions("cursor", { pi_model: "provider/model" }), /only valid when backend=pi/);
+	assert.equal(resolveCursorSpawnModel("pi", "not-a-preset"), undefined);
 });
 
 test("Pi tool inheritance excludes parent-only extension tools", () => {
@@ -300,34 +264,16 @@ test("Pi tool inheritance excludes parent-only extension tools", () => {
 	);
 });
 
-test("settled subagents auto-close after fifteen idle minutes", async () => {
+test("settled subagents retain the documented fifteen-minute idle-close window", () => {
 	assert.equal(SUBAGENT_IDLE_CLOSE_MS, 15 * 60 * 1000);
-	const { readFile } = await import("node:fs/promises");
-	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
-	assert.match(source, /scheduleIdleClose\(live\.info\)/);
-	assert.match(source, /this\.clearIdleClose\(info\.id\);[\s\S]*this\.clearCompletionMail\(info\)/);
-	assert.match(source, /Persist the claim before awaiting resource cleanup/);
-	assert.match(source, /auto-closed after 15 minutes idle/);
 });
 
-test("response deltas stay out of the journal until one finalized response", async () => {
-	const { readFile } = await import("node:fs/promises");
-	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
-	const piRuntime = await readFile(new URL("../extensions/pi-runtime.ts", import.meta.url), "utf8");
-	const piHandler = source.slice(source.indexOf("private handlePiEvent"), source.indexOf("private handleCursorNotification"));
-	const cursorHandler = source.slice(source.indexOf("private handleCursorNotification"), source.indexOf("private async handleCursorRequest"));
-	const finalize = source.slice(source.indexOf("private finalize"), source.indexOf("private completionEvent"));
-	assert.doesNotMatch(piHandler, /kind: "response"/);
-	assert.doesNotMatch(cursorHandler, /kind: "response"/);
-	assert.match(piHandler, /live\.currentOutput \+= event\.text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", event\.text\)/);
-	assert.match(cursorHandler, /live\.currentOutput \+= text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", text\)/);
-	assert.match(piRuntime, /this\.candidateResponse = messageText\(event\.message\);/);
-	assert.match(piRuntime, /this\.candidateResponse = messageText\(assistant\);/);
-	assert.doesNotMatch(piRuntime, /this\.candidateResponse = messageText\([^)]*\)\.trim\(\);/);
-	const responseAppend = 'this.appendLedger(live.info, { kind: "response", text: live.info.finalResponse });';
-	assert.equal(finalize.split(responseAppend).length - 1, 1);
-	assert.ok(finalize.indexOf(responseAppend) < finalize.indexOf('this.appendLedger(live.info, { kind: "runtime", state: status })'));
-	assert.ok(finalize.indexOf(responseAppend) < finalize.indexOf('this.appendLedger(live.info, { kind: "completion", status, summary: error ?? live.info.finalResponse })'));
+test("response journal normalization accepts one finalized response and never raw thought", () => {
+	// The controlled runtime integration test verifies that streaming text is materialized once
+	// at terminal transition. The journal contract independently rejects raw thought payloads.
+	const event = normalizeRunLedgerEvent({ v: 1, seq: 1, ts: 1, turn: 1, kind: "response", text: "final response" });
+	assert.deepEqual(event, { v: 1, seq: 1, ts: 1, turn: 1, kind: "response", text: "final response" });
+	assert.equal(normalizeRunLedgerEvent({ v: 1, seq: 2, ts: 2, turn: 1, kind: "thought", text: "raw thought" }), undefined);
 });
 
 test("activity summaries prefer sanitized live phases and fall back to the task", () => {

@@ -5,8 +5,6 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
-	openSync,
-	closeSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -43,7 +41,7 @@ import {
 	type JsonRpcMessage,
 } from "./acp.ts";
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
-import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent, type PermissionMailKey } from "./mailbox.ts";
+import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent } from "./mailbox.ts";
 import {
 	normalizeRunLedgerEvent,
 	generatedThoughtPreview,
@@ -61,8 +59,8 @@ import {
 	resolveAgentPermissionDecision,
 	resolveAutomaticPermission,
 	resolvePromptPermissionSelection,
-	type PermissionResult,
 	restoreCursorConfigVerified,
+	type PermissionResult,
 	skippedAskQuestion,
 	type PermissionMode,
 } from "./helpers.ts";
@@ -71,6 +69,12 @@ import type {
 	ManagerStateListener, ManagerStateSnapshot, PiRuntimeAgent, UnifiedStoragePaths, UnifiedSubagentDependencies, UnifiedTestObserver,
 } from "./unified-deps.ts";
 import { PiRpcClient, JsonlDecoder, normalizePiRpcToolEvent, type NormalizedBackendToolEvent } from "./pi-runtime.ts";
+import {
+	TurnManifestStore, addAgentAtScope, admitFifo, closeAgent as closeManifestAgent, createParentManifest,
+	enqueueTurn, materializeAgentProjections, migrateLegacyInfo, reconcileManifest, replaceCursorTurn,
+	transitionTurn, touchTurn, updateAgentRuntimeResources,
+	type ManifestAgent, type ManifestTurn, type ParentManifestV1, type ResolvedExecutionSnapshot,
+} from "./turn-manifest.ts";
 export { JsonlDecoder, normalizePiRpcToolEvent };
 export type { NormalizedBackendToolEvent };
 
@@ -90,12 +94,13 @@ const PRODUCTION_PATHS: UnifiedStoragePaths = {
 const MAX_AGENTS = 8;
 const DEFAULT_PI_TOOLS = "read,bash,grep,find,ls";
 const PERMISSION_TIMEOUT_MS = 120_000;
+const CURSOR_CANCEL_TIMEOUT_MS = 2_000;
 export const SUBAGENT_IDLE_CLOSE_MS = 15 * 60 * 1000;
 const PARENT_SOURCE = `${PACKAGE_NAME}:unified-parent`;
-const FINAL = new Set<AgentStatus>(["completed", "failed", "interrupted", "closed"]);
+const FINAL = new Set<AgentStatus>(["completed", "failed", "interrupted", "paused", "closed"]);
 
 export type AgentBackend = "pi" | "cursor";
-export type AgentStatus = "starting" | "running" | "completed" | "failed" | "interrupted" | "closed";
+export type AgentStatus = "queued" | "starting" | "running" | "completed" | "failed" | "interrupted" | "paused" | "closed";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export function requirePendingApproval<T>(pendingApprovals: ReadonlyMap<string, T>, approvalId: string, agentName: string): T {
@@ -159,6 +164,10 @@ export interface AgentInfo {
 	lastTaskMessage?: string;
 	finalResponse?: string;
 	error?: string;
+	/** Current canonical manifest turn identity and ordinal. */
+	currentTurnId?: string;
+	turnSequence?: number;
+	terminalReason?: string;
 }
 
 /** The private viewer journal is deterministically derived, never persisted in AgentInfo. */
@@ -254,6 +263,9 @@ interface PendingApproval {
 
 interface RuntimeHandle {
 	info: AgentInfo;
+	/** Callback ownership is checked against this immutable manifest identity. */
+	turnId: string;
+	epoch: string;
 	kind: AgentBackend;
 	pi?: PiRuntime;
 	cursor?: CursorRuntime;
@@ -273,6 +285,8 @@ interface RuntimeHandle {
 	thoughtTimer?: ReturnType<typeof setTimeout>;
 	promptPermissionPending: boolean;
 	pendingApprovals: Map<string, PendingApproval>;
+	/** Current Cursor prompt settles after ACP acknowledges completion/cancellation. */
+	turnPromise?: Promise<{ stopReason?: string }>;
 }
 
 
@@ -564,39 +578,6 @@ function templatesDescription(paths: UnifiedStoragePaths = PRODUCTION_PATHS): st
 	}).join("\n");
 }
 
-function saveInfo(info: AgentInfo, now = Date.now): void {
-	info.updatedAt = now();
-	ensureDir(resolve(info.infoFile, ".."));
-	atomicJson(info.infoFile, info);
-}
-
-function readScope(parentSessionId: string, paths: UnifiedStoragePaths = PRODUCTION_PATHS): AgentInfo[] {
-	const dir = scopeDir(parentSessionId, paths);
-	if (!existsSync(dir)) return [];
-	return readdirSync(dir)
-		.filter((name) => name.endsWith(".info.json"))
-		.flatMap((name) => {
-			const info = readJson<AgentInfo>(join(dir, name));
-			return info ? [info] : [];
-		})
-		.sort((a, b) => b.lastActivity - a.lastActivity);
-}
-
-function readAll(paths: UnifiedStoragePaths = PRODUCTION_PATHS): AgentInfo[] {
-	const root = runsDir(paths);
-	if (!existsSync(root)) return [];
-	const result: AgentInfo[] = [];
-	for (const scope of readdirSync(root, { withFileTypes: true })) {
-		if (!scope.isDirectory() || scope.name === "_outputs") continue;
-		for (const name of readdirSync(join(root, scope.name))) {
-			if (!name.endsWith(".info.json")) continue;
-			const info = readJson<AgentInfo>(join(root, scope.name, name));
-			if (info) result.push(info);
-		}
-	}
-	return result.sort((a, b) => b.lastActivity - a.lastActivity);
-}
-
 function log(info: Pick<AgentInfo, "logFile">, category: string, message: string): void {
 	ensureDir(resolve(info.logFile, ".."));
 	for (const line of String(message).replace(/\r/g, "").split("\n")) {
@@ -719,21 +700,25 @@ class UnifiedManager {
 	private readonly paths: UnifiedStoragePaths;
 	private readonly now: () => number;
 	private readonly uuid: () => string;
+	private readonly epoch: string;
 	private readonly commandRunner: CommandRunner;
 	private readonly herdr?: HerdrOperations;
 	private readonly createPiRuntime: NonNullable<UnifiedSubagentDependencies["createPiRuntime"]>;
 	private readonly createCursorRuntime: NonNullable<UnifiedSubagentDependencies["createCursorRuntime"]>;
 	private readonly stateListeners = new Map<string, Set<ManagerStateListener>>();
 	private readonly lastSnapshots = new Map<string, string>();
-	/** Per-agent control serialization only; the durable queue manifest is Phase 2. */
-	private readonly controlQueues = new Map<string, Promise<void>>();
-	private readonly viewerClosures = new Map<string, Promise<void>>();
+	private readonly stores = new Map<string, TurnManifestStore>();
+	private readonly readyParents = new Set<string>();
 	private readonly live = new Map<string, RuntimeHandle>();
+	private readonly controlQueues = new Map<string, Promise<void>>();
 	private readonly mailbox = new Mailbox<AgentStatus>();
 	private waiters: Waiter[] = [];
 	private readonly waitAllScopes = new Set<WaitAllScope>();
 	private readonly idleCloseTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; completedAt: number }>();
 	private readonly defaultWaitTargets = new Map<string, Set<string>>();
+	private readonly draining = new Set<string>();
+	private readonly drainRequested = new Set<string>();
+	private readonly lastActivityCommit = new Map<string, number>();
 	private ctx?: ExtensionContext;
 	private parentSeq = 0;
 	private ledgerSeq = 0;
@@ -743,70 +728,160 @@ class UnifiedManager {
 	private widgetTimer?: ReturnType<typeof setInterval>;
 
 	constructor(pi: ExtensionAPI, dependencies: UnifiedSubagentDependencies = {}) {
-		this.pi = pi;
-		this.now = dependencies.clock ?? Date.now;
-		this.uuid = dependencies.uuid ?? randomUUID;
-		this.paths = { ...PRODUCTION_PATHS, viewerPath: RUN_LEDGER_VIEWER_PATH, ...dependencies.paths };
-		this.commandRunner = dependencies.commandRunner ?? runCommand;
-		this.herdr = dependencies.herdr;
+		this.pi = pi; this.now = dependencies.clock ?? Date.now; this.uuid = dependencies.uuid ?? randomUUID;
+		this.epoch = this.uuid(); this.paths = { ...PRODUCTION_PATHS, viewerPath: RUN_LEDGER_VIEWER_PATH, ...dependencies.paths };
+		this.commandRunner = dependencies.commandRunner ?? runCommand; this.herdr = dependencies.herdr;
 		this.createPiRuntime = dependencies.createPiRuntime ?? ((info, handlers) => new PiRpcClient(info, handlers.onEvent, handlers.onExit, (category, message) => log(info, category, message)));
 		this.createCursorRuntime = dependencies.createCursorRuntime ?? ((cwd, handlers) => new CursorAcpClient(cwd, handlers));
-		this.parentSeq = this.now() * 1000;
-		this.ledgerSeq = this.now() * 1000;
-		ensureDir(this.paths.root);
-		ensureDir(this.paths.agentsDir);
-		ensureDir(runsDir(this.paths));
+		this.parentSeq = this.now() * 1000; this.ledgerSeq = this.now() * 1000;
+		ensureDir(this.paths.root); ensureDir(this.paths.agentsDir); ensureDir(runsDir(this.paths));
 	}
 
-	/** A parent-scoped, redacted state surface for future queue/UI consumers. */
-	snapshot(parentSessionId: string): ManagerStateSnapshot {
-		return {
-			parentSessionId,
-			agents: this.readScope(parentSessionId).map((info) => ({
-				id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model,
-				thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status,
-				createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt,
-				completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity,
-				activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null,
-			})),
-		};
+	private store(parent: string): TurnManifestStore {
+		let store = this.stores.get(parent);
+		if (!store) { store = new TurnManifestStore(scopeDir(parent, this.paths), { now: this.now, uuid: this.uuid }); this.stores.set(parent, store); }
+		return store;
 	}
-
-	subscribe(parentSessionId: string, listener: ManagerStateListener): () => void {
-		const listeners = this.stateListeners.get(parentSessionId) ?? new Set<ManagerStateListener>();
-		if (!listeners.has(listener)) {
-			listeners.add(listener);
-			this.stateListeners.set(parentSessionId, listeners);
-			const snapshot = this.snapshot(parentSessionId);
-			this.lastSnapshots.set(parentSessionId, JSON.stringify(snapshot));
-			try { listener(snapshot); } catch { /* observers cannot affect runtime persistence */ }
+	/** The manifest is the only authority. Info files are write-only compatibility projections. */
+	private ensureParentReady(parent: string): ParentManifestV1 {
+		const store = this.store(parent); const dir = store.scopeDir;
+		let manifest: ParentManifestV1;
+		try {
+			// A missing manifest is the one compatibility exception: import legacy projections once
+			// while the store initialization lock establishes canonical ownership.
+			if (!existsSync(store.manifestPath)) {
+				const legacy = existsSync(dir) ? readdirSync(dir).filter((name) => name.endsWith(".info.json")).map((name) => {
+					const value = readJson<AgentInfo>(join(dir, name));
+					if (!value) throw new Error(`Legacy agent projection is unreadable: ${join(dir, name)}`);
+					return value;
+				}) : [];
+				// Legacy finalResponse was formerly projection-owned. Preserve it in the private
+				// response file before the manifest records a reference to that file.
+				for (const info of legacy) if (info.finalResponse !== undefined) writePrivate(info.responseFile, info.finalResponse);
+				manifest = store.initialize(legacy.length ? migrateLegacyInfo(parent, this.epoch, legacy as any, this.now()) : createParentManifest(parent, this.epoch, this.now()));
+			} else manifest = store.initialize(createParentManifest(parent, this.epoch, this.now()));
+		} catch (error) { throw error; } // Corruption deliberately fails closed.
+		if (manifest.parentSessionId !== parent) throw new Error(`Turn manifest parent session differs for ${parent}.`);
+		let reconciled = false;
+		if (manifest.epoch !== this.epoch) {
+			// Ownership is claimed once. A stale manager must never reconcile a newer
+			// manager back to its own epoch merely because an old callback fired.
+			if (this.readyParents.has(parent)) throw new Error(`Turn manifest epoch ownership was lost for ${parent}.`);
+			manifest = store.mutate(manifest.epoch, (current) => reconcileManifest(current, this.epoch, this.now()));
+			reconciled = true;
 		}
-		let active = true;
-		return () => {
-			if (!active) return;
-			active = false;
-			listeners.delete(listener);
-			if (listeners.size === 0) {
-				this.stateListeners.delete(parentSessionId);
-				this.lastSnapshots.delete(parentSessionId);
+		this.readyParents.add(parent); this.writeProjections(manifest, dir);
+		if (reconciled) this.scheduleReconciledViewerCleanup(parent, this.project(manifest));
+		return manifest;
+	}
+	private scheduleReconciledViewerCleanup(parent: string, infos: AgentInfo[]): void {
+		const stale = infos.filter((info) => (info.terminalReason === "restart-interrupted" || info.terminalReason === "shutdown-paused") && (info.viewerPaneId || info.viewerTabId));
+		if (!stale.length) return;
+		queueMicrotask(() => void (async () => {
+			for (const info of stale) {
+				await this.closeViewer(info).catch(() => undefined);
+				try { this.mutate(parent, (current) => current.agents[info.id]?.currentTurnId === info.currentTurnId && !current.agents[info.id]?.closed ? updateAgentRuntimeResources(current, info.id, { viewerPaneId: null, viewerTabId: null }, this.now()) : current); } catch {}
 			}
-		};
+		})());
+	}
+	private response(reference: { path: string }): string | undefined {
+		try { return readFileSync(reference.path, "utf8"); } catch { return undefined; }
+	}
+	private project(manifest: ParentManifestV1): AgentInfo[] {
+		return materializeAgentProjections(manifest, { readResponse: (reference) => this.response(reference) }).map((value) => {
+			const turn = value.currentTurnId ? manifest.turns[value.currentTurnId] : undefined;
+			return { ...value, skills: value.skills, skillPaths: value.skillPaths, extensions: value.extensions, extensionPaths: value.extensionPaths,
+				status: value.status as AgentStatus, thinking: value.thinking as ThinkingLevel | undefined, cursorModel: value.cursorModel as CursorModel | undefined,
+				turnSequence: turn?.sequence, terminalReason: turn?.terminalReason } as AgentInfo;
+		});
+	}
+	private writeProjections(manifest: ParentManifestV1, dir = this.store(manifest.parentSessionId).scopeDir): void {
+		ensureDir(dir);
+		for (const info of this.project(manifest)) atomicJson(info.infoFile, info);
+	}
+	/** Synchronous manifest transaction, followed only by derived projections and observers. */
+	private mutate(parent: string, change: (manifest: ParentManifestV1) => ParentManifestV1): ParentManifestV1 {
+		this.ensureParentReady(parent); const manifest = this.store(parent).mutate(this.epoch, change);
+		this.writeProjections(manifest); this.publishState(parent); this.refresh(); return manifest;
+	}
+	private manifest(parent: string): ParentManifestV1 { return this.ensureParentReady(parent); }
+	private readScope(parent: string): AgentInfo[] { return this.project(this.manifest(parent)).sort((a, b) => b.lastActivity - a.lastActivity); }
+	private readAll(): AgentInfo[] {
+		const root = runsDir(this.paths); if (!existsSync(root)) return []; const infos: AgentInfo[] = [];
+		for (const entry of readdirSync(root, { withFileTypes: true })) {
+			if (!entry.isDirectory() || entry.name === "_outputs") continue;
+			const store = new TurnManifestStore(join(root, entry.name), { now: this.now, uuid: this.uuid });
+			const manifest = store.read(); // A corrupt historical manifest is not silently hidden.
+			this.writeProjections(manifest, store.scopeDir); infos.push(...this.project(manifest));
+		}
+		return infos.sort((a, b) => b.lastActivity - a.lastActivity);
+	}
+	private current(parent: string, id: string): { manifest: ParentManifestV1; agent: ManifestAgent; turn?: ManifestTurn; info: AgentInfo } {
+		const manifest = this.manifest(parent); const agent = manifest.agents[id]; if (!agent) throw new Error(`Agent not found in this parent session.`);
+		const info = this.project(manifest).find((entry) => entry.id === id)!; return { manifest, agent, turn: agent.currentTurnId ? manifest.turns[agent.currentTurnId] : undefined, info };
 	}
 
-	private publishState(parentSessionId: string): void {
-		const listeners = this.stateListeners.get(parentSessionId);
-		if (!listeners?.size) {
-			this.lastSnapshots.delete(parentSessionId);
-			return;
-		}
-		const snapshot = this.snapshot(parentSessionId);
-		const serialized = JSON.stringify(snapshot);
-		if (this.lastSnapshots.get(parentSessionId) === serialized) return;
-		this.lastSnapshots.set(parentSessionId, serialized);
-		for (const listener of listeners) {
-			try { listener(snapshot); } catch { /* one faulty UI observer must not break others */ }
+	snapshot(parentSessionId: string): ManagerStateSnapshot {
+		return { parentSessionId, agents: this.readScope(parentSessionId).map((info) => ({ id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity, activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null })) };
+	}
+	subscribe(parent: string, listener: ManagerStateListener): () => void {
+		const listeners = this.stateListeners.get(parent) ?? new Set<ManagerStateListener>();
+		if (!listeners.has(listener)) { listeners.add(listener); this.stateListeners.set(parent, listeners); const snapshot = this.snapshot(parent); this.lastSnapshots.set(parent, JSON.stringify(snapshot)); try { listener(snapshot); } catch {} }
+		let active = true; return () => { if (!active) return; active = false; listeners.delete(listener); if (!listeners.size) { this.stateListeners.delete(parent); this.lastSnapshots.delete(parent); } };
+	}
+	private publishState(parent: string): void {
+		const listeners = this.stateListeners.get(parent); if (!listeners?.size) return;
+		const snapshot = this.snapshot(parent); const serialized = JSON.stringify(snapshot); if (this.lastSnapshots.get(parent) === serialized) return;
+		this.lastSnapshots.set(parent, serialized); for (const listener of listeners) try { listener(snapshot); } catch {}
+	}
+	attach(ctx: ExtensionContext): void {
+		this.ctx = ctx; try { this.ensureParentReady(this.parentSessionId(ctx)); } catch { /* tool calls expose durable corruption */ }
+		this.refresh(); this.updateWidget(); if (!this.widgetTimer) { this.widgetTimer = setInterval(() => this.updateWidget(), 1000); this.widgetTimer.unref?.(); }
+	}
+	parentSessionId(ctx: ExtensionContext | ExtensionCommandContext): string { const id = ctx.sessionManager.getSessionId?.(); if (!id) throw new Error("The parent Pi session has no persistent session id."); return String(id); }
+	templateDescription(): string { return templatesDescription(this.paths); }
+	templateDirectory(): string { return this.paths.agentsDir; }
+	list(parent: string, includeAll = false, pathPrefix?: string): AgentInfo[] { const prefix = pathPrefix?.trim().replace(/^\/+/, ""); return (includeAll ? this.readAll() : this.readScope(parent)).filter((info) => !prefix || info.taskName.startsWith(prefix)); }
+	get(target: string, parent: string): AgentInfo { const name = normalizeTaskName(target); const info = this.readScope(parent).find((entry) => entry.taskName === name); if (!info) throw new Error(`Agent not found in this parent session: /${name}`); return info; }
+
+	private execution(agent: ManifestAgent, prompt: string, displayMessage: string): ResolvedExecutionSnapshot {
+		return { backend: agent.backend, cwd: agent.cwd, model: agent.model, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools, skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, sessionFile: agent.sessionFile, prompt, displayMessage };
+	}
+	private initializeLedger(info: AgentInfo): void {
+		const path = runLedgerJournalPath(info); ensureDir(resolve(path, "..")); const created = !existsSync(path); if (created) writePrivate(path, ""); else try { chmodSync(path, 0o600); } catch {}
+		if (created) { this.appendLedger(info, { kind: "run", runId: info.id, createdAt: info.createdAt, title: info.canonicalName, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.thinking, cwd: info.cwd }); this.appendLedger(info, { kind: "runtime", state: info.status, detail: "journal initialized" }); }
+	}
+	private appendLedger(info: AgentInfo, fields: { kind: RunLedgerEvent["kind"]; turn?: number } & Record<string, unknown>): void { const now = this.now(); const seq = this.ledgerSeq = Math.max(this.ledgerSeq + 1, now * 1000); const event = normalizeRunLedgerEvent({ v: 1, seq, ts: now, turn: info.turn, ...fields }); if (event) try { appendFileSync(runLedgerJournalPath(info), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }); } catch {} }
+	private async ensurePrerequisites(backend: AgentBackend, cwd: string): Promise<void> { if (this.herdr) return this.herdr.ensure(backend, cwd); if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) throw new Error("Subagents require Pi to run inside a Herdr workspace."); const commands: Array<[string, string[]]> = [[resolveExecutable("herdr", process.env.HERDR_BIN), ["--version"]], backend === "cursor" ? [resolveExecutable("agent", process.env.CURSOR_AGENT_BIN), ["--version"]] : [piInvocation().command, ["--version"]]]; for (const [command, args] of commands) { const result = await this.commandRunner(command, args, cwd, 5000); if (result.code !== 0) throw new Error((result.stderr || `${command} is unavailable`).trim()); } }
+	private piRuntimeAgent(agent: ManifestAgent): PiRuntimeAgent { return { canonicalName: agent.canonicalName, cwd: agent.cwd, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools, skillPaths: [...agent.skillPaths], extensionPaths: [...agent.extensionPaths], sessionFile: agent.sessionFile, logFile: agent.logFile }; }
+	private herdrAgent(info: AgentInfo): HerdrAgent { return { id: info.id, canonicalName: info.canonicalName, backend: info.backend, cwd: info.cwd, viewerPaneId: info.viewerPaneId, viewerTabId: info.viewerTabId }; }
+	private async createViewer(info: AgentInfo): Promise<{ paneId: string; tabId: string }> {
+		if (this.herdr) return this.herdr.createViewer(this.herdrAgent(info));
+		this.initializeLedger(info); let paneId: string | undefined; let tabId: string | undefined;
+		try {
+			const result = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["tab", "create", "--workspace", process.env.HERDR_WORKSPACE_ID!, "--cwd", info.cwd, "--label", `${info.taskName} [${info.backend}]`, "--no-focus"], info.cwd, 5000);
+			if (result.code !== 0) throw new Error((result.stderr || result.stdout || "herdr tab create failed").trim());
+			let parsed: any; try { parsed = JSON.parse(result.stdout); } catch { throw new Error(`Unexpected Herdr output: ${result.stdout.trim()}`); }
+			paneId = parsed.result?.root_pane?.pane_id; tabId = parsed.result?.tab?.tab_id ?? parsed.result?.root_pane?.tab_id;
+			if (!paneId || !tabId) throw new Error("Herdr did not return viewer pane/tab ids.");
+			const viewerCommand = buildRunLedgerViewerCommand({ nodeExecutable: process.execPath, viewerPath: this.paths.viewerPath ?? RUN_LEDGER_VIEWER_PATH, infoPath: info.infoFile, journalPath: runLedgerJournalPath(info), rawLogPath: info.logFile });
+			const viewer = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "run", paneId, viewerCommand], info.cwd, 5000);
+			if (viewer.code !== 0) throw new Error((viewer.stderr || viewer.stdout || "Could not start Run Ledger viewer").trim());
+			return { paneId, tabId };
+		} catch (error) {
+			// pane-run and parse failures occur after tab creation; do not leave an orphan viewer.
+			try { if (tabId) await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["tab", "close", tabId], info.cwd, 5000); else if (paneId) await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "close", paneId], info.cwd, 5000); } catch {}
+			throw error;
 		}
 	}
+	private async closeViewer(info: AgentInfo): Promise<void> {
+		if (!info.viewerPaneId && !info.viewerTabId) return;
+		const viewer = this.herdrAgent(info);
+		if (this.herdr) return this.herdr.closeViewer(viewer);
+		if (viewer.viewerTabId) { const result = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["tab", "close", viewer.viewerTabId], viewer.cwd, 5000); if (result.code === 0) return; }
+		if (viewer.viewerPaneId) await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "close", viewer.viewerPaneId], viewer.cwd, 5000);
+	}
+
 
 	private enqueueControl<T>(id: string, operation: () => Promise<T>): Promise<T> {
 		const previous = this.controlQueues.get(id) ?? Promise.resolve();
@@ -816,611 +891,74 @@ class UnifiedManager {
 		void tail.finally(() => { if (this.controlQueues.get(id) === tail) this.controlQueues.delete(id); });
 		return run;
 	}
-
-	private persist(info: AgentInfo): void {
-		saveInfo(info, this.now);
-		this.publishState(info.parentSessionId);
-	}
-
-	private readScope(parentSessionId: string): AgentInfo[] { return readScope(parentSessionId, this.paths); }
-	private readAll(): AgentInfo[] { return readAll(this.paths); }
-
-	/** Initialize a private journal before a Herdr pane can observe it. */
-	private initializeLedger(info: AgentInfo): void {
-		const path = runLedgerJournalPath(info);
-		ensureDir(resolve(path, ".."));
-		const created = !existsSync(path);
-		if (created) writePrivate(path, "");
-		else { try { chmodSync(path, 0o600); } catch {} }
-		if (!created) return;
-		this.appendLedger(info, {
-			kind: "run", runId: info.id, createdAt: info.createdAt, title: info.canonicalName, agentName: info.canonicalName,
-			backend: info.backend, model: info.model, thinking: info.thinking, cwd: info.cwd,
-		});
-		this.appendLedger(info, { kind: "runtime", state: info.status, detail: "journal initialized" });
-	}
-
-	private appendLedger(info: AgentInfo, fields: { kind: RunLedgerEvent["kind"]; turn?: number } & Record<string, unknown>): void {
-		const now = this.now();
-		const seq = this.ledgerSeq = Math.max(this.ledgerSeq + 1, now * 1000);
-		const candidate = { v: 1, seq, ts: now, turn: info.turn, ...fields };
-		const event = normalizeRunLedgerEvent(candidate);
-		if (!event) return;
-		try { appendFileSync(runLedgerJournalPath(info), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }); } catch { /* journal must never break raw runtime logging */ }
-	}
-
-	private flushThought(live: RuntimeHandle): void {
-		if (live.thoughtTimer) clearTimeout(live.thoughtTimer);
-		live.thoughtTimer = undefined;
-		if (!live.thoughtChunks) return;
-		this.appendLedger(live.info, {
-			kind: "thought", previewKind: live.thoughtPreviewKind ?? "generic", preview: live.thoughtPreview ?? "Working through details",
-			chunks: live.thoughtChunks, characters: live.thoughtCharacters,
-		});
-		live.thoughtChunks = 0; live.thoughtCharacters = 0; live.thoughtPreview = undefined; live.thoughtPreviewKind = undefined;
-	}
-
-	private terminalizeActiveTools(live: RuntimeHandle, status: string): void {
-		for (const event of terminalizeActiveToolEvents(live.activeTools, status)) {
-			this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status });
-		}
-		live.activeTools.clear();
-	}
-
-	private bufferThought(live: RuntimeHandle, raw: unknown): void {
-		const text = typeof raw === "string" ? raw : "";
-		if (!text.trim()) return;
-		live.thoughtChunks++;
-		live.thoughtCharacters += Array.from(text).length;
-		const generated = generatedThoughtPreview(text);
-		if (!generated) return;
-		if (!live.thoughtPreview || (live.thoughtPreviewKind === "generic" && generated.previewKind === "heading")) {
-			live.thoughtPreview = generated.preview;
-			live.thoughtPreviewKind = generated.previewKind;
-		}
-		if (live.thoughtTimer) clearTimeout(live.thoughtTimer);
-		live.thoughtTimer = setTimeout(() => this.flushThought(live), 200);
-		live.thoughtTimer.unref?.();
-	}
-
-	attach(ctx: ExtensionContext): void {
-		this.ctx = ctx;
-		this.updateWidget();
-		if (!this.widgetTimer) {
-			this.widgetTimer = setInterval(() => this.updateWidget(), 1000);
-			this.widgetTimer.unref?.();
-		}
-	}
-
-	parentSessionId(ctx: ExtensionContext | ExtensionCommandContext): string {
-		const id = ctx.sessionManager.getSessionId?.();
-		if (!id) throw new Error("The parent Pi session has no persistent session id.");
-		return String(id);
-	}
-
-	/** Internal registration metadata follows the same injected template root as spawn. */
-	templateDescription(): string { return templatesDescription(this.paths); }
-	templateDirectory(): string { return this.paths.agentsDir; }
-
-	list(parentSessionId: string, includeAll = false, pathPrefix?: string): AgentInfo[] {
-		const prefix = pathPrefix?.trim().replace(/^\/+/, "");
-		return (includeAll ? this.readAll() : this.readScope(parentSessionId)).filter((info) => !prefix || info.taskName.startsWith(prefix));
-	}
-
-	get(target: string, parentSessionId: string): AgentInfo {
-		const name = normalizeTaskName(target);
-		const info = this.readScope(parentSessionId).find((entry) => entry.taskName === name);
-		if (!info) throw new Error(`Agent not found in this parent session: /${name}`);
-		return this.live.get(info.id)?.info ?? info;
-	}
-
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<AgentInfo> {
-		validateSpawnPiOptions(params.backend, params);
-		const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
-		if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
-		const taskName = normalizeTaskName(params.task_name);
-		const template = params.agent_type ? listAgentTemplates(this.paths).find((entry) => entry.name === params.agent_type) : undefined;
-		if (params.agent_type && !template) throw new Error(`Agent template not found: ${params.agent_type}`);
-		if (template?.backend && template.backend !== params.backend) {
-			throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
-		}
-		const piSelection = params.backend === "pi"
-			? resolvePiSpawnSelection({
-				piModel: params.pi_model,
-				piThinking: params.pi_thinking,
-				template,
-				parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
-				parentThinking: this.pi.getThinkingLevel() as ThinkingLevel,
-			})
-			: undefined;
-		if (piSelection) {
-			validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId));
-		}
-		const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
-		await this.ensurePrerequisites(params.backend, cwd);
-		const parentSessionId = this.parentSessionId(ctx);
-		if (this.readScope(parentSessionId).filter((info) => info.status !== "closed").length >= MAX_AGENTS) {
-			throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
-		}
-		const dir = scopeDir(parentSessionId, this.paths);
-		ensureDir(dir);
-		const lockPath = join(dir, `.task-${taskStorageKey(taskName)}.lock`);
-		let lock: number | undefined;
+		validateSpawnPiOptions(params.backend, params); const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd; if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
+		const taskName = normalizeTaskName(params.task_name); const template = params.agent_type ? listAgentTemplates(this.paths).find((entry) => entry.name === params.agent_type) : undefined; if (params.agent_type && !template) throw new Error(`Agent template not found: ${params.agent_type}`); if (template?.backend && template.backend !== params.backend) throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
+		const piSelection = params.backend === "pi" ? resolvePiSpawnSelection({ piModel: params.pi_model, piThinking: params.pi_thinking, template, parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, parentThinking: this.pi.getThinkingLevel() as ThinkingLevel }) : undefined; if (piSelection) validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId)); const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
+		await this.ensurePrerequisites(params.backend, cwd); const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent); if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`); if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
+		const id = this.uuid(); const now = this.now(); const config = readJson<Config>(this.paths.configPath) ?? {}; const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined; const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined; const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : []; const selectedTools = params.backend === "pi" ? template?.tools ?? (configuredExtensions?.length ? undefined : selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools())) : undefined;
+		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths: selectedSkills.map((skill) => resolveSkillPath(skill, cwd)), extensions: configuredExtensions ?? [], extensionPaths: (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, cwd)), cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
+		const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n"); const turnId = this.uuid();
+		const queued = this.mutate(parent, (current) => {
+			if (Object.values(current.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
+			if (Object.values(current.agents).some((agent) => agent.taskName === taskName || agent.canonicalName === `/${taskName}`)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
+			let next = addAgentAtScope(current, this.store(parent).scopeDir, proto as any, now);
+			const agent = next.agents[id]!;
+			return enqueueTurn(next, { id: turnId, agentId: id, source: "initial", execution: this.execution(agent, prompt, params.message), createdAt: now, ownerEpoch: this.epoch });
+		});
+		let info = this.project(queued).find((entry) => entry.id === id)!;
 		try {
-			try { lock = openSync(lockPath, "wx", 0o600); }
-			catch (error: any) {
-				if (error?.code === "EEXIST") throw new Error(`Agent /${taskName} is already being created.`);
-				throw error;
-			}
-			if (this.readScope(parentSessionId).some((info) => info.taskName === taskName)) {
-				throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
-			}
-			const id = this.uuid();
-			const prefix = join(dir, id);
-			const now = this.now();
-			const config = readJson<Config>(this.paths.configPath) ?? {};
-			const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
-			const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
-			const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : [];
-			const inheritedPiTools = selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools());
-			const selectedTools = params.backend === "pi"
-				? template?.tools !== undefined
-					? template.tools
-					: configuredExtensions?.length
-						? undefined
-						: inheritedPiTools
-				: undefined;
-			const info: AgentInfo = {
-				id,
-				taskName,
-				canonicalName: `/${taskName}`,
-				backend: params.backend,
-				parentSessionId,
-				parentSessionFile: ctx.sessionManager.getSessionFile?.(),
-				agentType: params.agent_type,
-				cwd,
-				model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL,
-				...(piSelection ? {
-					provider: piSelection.provider,
-					modelId: piSelection.modelId,
-					thinking: piSelection.thinking,
-				} : {}),
-				tools: selectedTools,
-				skills: selectedSkills,
-				skillPaths: selectedSkills.map((skill) => resolveSkillPath(skill, cwd)),
-				extensions: configuredExtensions,
-				extensionPaths: configuredExtensions?.map((extension) => resolveExtensionPath(extension, cwd)),
-				cursorModel,
-				permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode),
-				sessionFile: params.backend === "pi" ? `${prefix}.session.jsonl` : undefined,
-				infoFile: `${prefix}.info.json`,
-				logFile: `${prefix}.events.log`,
-				responseFile: `${prefix}.response.txt`,
-				createdAt: now,
-				updatedAt: now,
-				startedAt: now,
-				lastActivity: now,
-				turn: 0,
-				status: "starting",
-				lastTaskMessage: params.message,
-			};
 			writePrivate(info.logFile, `${params.backend.toUpperCase()} subagent ${info.canonicalName}\nCwd: ${cwd}\nModel: ${info.model}\n\n`);
-			this.persist(info);
-			this.initializeLedger(info);
-			try {
-				const viewer = await this.createViewer(info);
-				info.viewerPaneId = viewer.paneId;
-				info.viewerTabId = viewer.tabId;
-				this.persist(info);
-				await this.startRuntime(info);
-				const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n");
-				await this.beginPrompt(info, prompt, params.message);
-				const targets = this.defaultWaitTargets.get(parentSessionId) ?? new Set<string>();
-				targets.add(info.canonicalName);
-				this.defaultWaitTargets.set(parentSessionId, targets);
-				return info;
-			} catch (error) {
-				info.status = "failed";
-				info.error = error instanceof Error ? error.message : String(error);
-				info.completedAt = this.now();
-				info.lastActivity = this.now();
-				this.appendLedger(info, { kind: "error", message: info.error });
-				this.appendLedger(info, { kind: "runtime", state: "failed" });
-				this.appendLedger(info, { kind: "completion", status: "failed", summary: info.error });
-				this.persist(info);
-				await this.closeLive(info.id, false).catch(() => undefined);
-				await this.closeViewer(info).catch(() => undefined);
-				throw error;
-			}
-		} finally {
-			if (lock !== undefined) closeSync(lock);
-			try { unlinkSync(lockPath); } catch {}
-		}
-	}
-
-	async send(parentSessionId: string, target: string, message: string): Promise<{ delivery: "steer" | "cancel-and-prompt" | "prompt" }> {
-		const info = this.get(target, parentSessionId);
-		return this.enqueueControl(info.id, () => this.sendNow(parentSessionId, target, message));
-	}
-
-	private async sendNow(parentSessionId: string, target: string, message: string): Promise<{ delivery: "steer" | "cancel-and-prompt" | "prompt" }> {
-		const info = this.get(target, parentSessionId);
-		if (info.status === "closed") throw new Error(`Agent is closed: ${info.canonicalName}`);
-		let live = this.live.get(info.id);
-		const wasLive = Boolean(live);
-		if (!live) {
-			if (info.status === "starting" || info.status === "running") {
-				info.status = "interrupted";
-				info.completedAt = this.now();
-				this.persist(info);
-			}
-			live = await this.startRuntime(info);
-		}
-		if (wasLive && live.pending) {
-			info.lastTaskMessage = message;
-			info.lastActivity = this.now();
-			this.persist(info);
-			if (info.backend === "pi") {
-				await live.pi!.steer(message);
-				this.setPhase(live, "Applying parent correction");
-				log(info, "steer", message);
-				return { delivery: "steer" };
-			}
-			if (live.queuedCursorMessage) throw new Error(`Cursor agent ${info.canonicalName} already has a corrective message queued.`);
-			live.queuedCursorMessage = message;
-			this.terminalizeActiveTools(live, "interrupted");
-			this.setPhase(live, "Applying parent correction");
-			this.rejectApprovals(live, true, "active Cursor turn interrupted");
-			live.cursor!.cancel();
-			log(info, "steer", `cancel-and-prompt: ${message}`);
-			return { delivery: "cancel-and-prompt" };
-		}
-		await this.beginPrompt(info, message, message);
-		const targets = this.defaultWaitTargets.get(parentSessionId) ?? new Set<string>();
-		targets.add(info.canonicalName);
-		this.defaultWaitTargets.set(parentSessionId, targets);
-		return { delivery: "prompt" };
-	}
-
-	async interrupt(parentSessionId: string, target: string): Promise<AgentStatus> {
-		const info = this.get(target, parentSessionId);
-		return this.enqueueControl(info.id, () => this.interruptNow(parentSessionId, target));
-	}
-
-	private async interruptNow(parentSessionId: string, target: string): Promise<AgentStatus> {
-		const info = this.get(target, parentSessionId);
-		const previous = info.status;
-		if (previous !== "starting" && previous !== "running") return previous;
-		const live = this.live.get(info.id);
-		if (live) {
-			live.generation++;
-			live.pending = false;
-			this.flushThought(live);
-			this.terminalizeActiveTools(live, "interrupted");
-			live.promptPermissionPending = false;
-			this.rejectApprovals(live, true, "agent interrupted");
-			try {
-				if (live.kind === "pi") await live.pi!.abort();
-				else live.cursor!.cancel();
-			} catch (error) {
-				log(info, "interrupt", `backend cancellation failed: ${error instanceof Error ? error.message : String(error)}`);
-			}
-		}
-		info.status = "interrupted";
-		info.completedAt = this.now();
-		info.lastActivity = this.now();
-		if (live) this.flushThought(live);
-		this.appendLedger(info, { kind: "runtime", state: "interrupted" });
-		this.appendLedger(info, { kind: "completion", status: "interrupted", summary: "agent interrupted" });
-		this.persist(info);
-		this.pushMail(this.completionEvent(info), false);
-		this.scheduleIdleClose(info);
-		this.refresh();
-		return previous;
-	}
-
-	async close(parentSessionId: string, target: string): Promise<AgentStatus> {
-		const info = this.get(target, parentSessionId);
-		return this.enqueueControl(info.id, () => this.closeNow(parentSessionId, target));
-	}
-
-	private async closeNow(parentSessionId: string, target: string): Promise<AgentStatus> {
-		const info = this.get(target, parentSessionId);
-		const previous = info.status;
-		if (previous === "closed") return previous;
-		const live = this.live.get(info.id);
-		if (live) {
-			live.closing = true;
-			live.generation++;
-			live.pending = false;
-		}
-		info.status = "closed";
-		info.closedAt = this.now();
-		info.lastActivity = this.now();
-		const active = live; if (active) { this.flushThought(active); this.terminalizeActiveTools(active, "closed"); }
-		this.appendLedger(info, { kind: "runtime", state: "closed" });
-		this.appendLedger(info, { kind: "completion", status: "closed", summary: "agent closed" });
-		this.persist(info);
-		await this.closeLive(info.id, true);
-		await this.closeViewer(info).catch(() => undefined);
-		this.pushMail(this.completionEvent(info), false);
-		this.refresh();
-		return previous;
-	}
-
-	respondPermission(parentSessionId: string, target: string, approvalId: string, decision: "approve" | "reject"): void {
-		const info = this.get(target, parentSessionId);
-		const live = this.live.get(info.id);
-		if (!live) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${info.canonicalName}.`);
-		const pending = requirePendingApproval(live.pendingApprovals, approvalId, info.canonicalName);
-		this.settleApproval(
-			live,
-			pending,
-			() => resolveAgentPermissionDecision(decision, pending.options),
-			`${approvalId} ${decision === "approve" ? "approved once" : "rejected"}`,
-		);
-		this.updateWidget();
-	}
-
-	readResponse(parentSessionId: string, target: string): { info: AgentInfo; response: string } {
-		const info = this.get(target, parentSessionId);
-		const stored = FINAL.has(info.status) && existsSync(info.responseFile) ? readFileSync(info.responseFile, "utf8") : "";
-		return { info, response: info.finalResponse ?? stored };
-	}
-
-	async waitAgent(parentSessionId: string, targets: string[] | undefined, signal?: AbortSignal): Promise<MailEvent> {
-		const normalized = targets?.length ? new Set(targets.map((target) => `/${normalizeTaskName(target)}`)) : undefined;
-		const existing = this.mailbox.claim(
-			(event) => event.parentSessionId === parentSessionId && (!normalized || normalized.has(event.agentName)),
-			(event) => this.isPermissionPending(event),
-		);
-		if (existing) return existing;
-		if (normalized) {
-			const infos = this.readScope(parentSessionId).filter((info) => normalized.has(info.canonicalName));
-			if (!infos.length) throw new Error(`No matching agents in this parent session: ${[...normalized].join(", ")}`);
-			const final = infos.find((info) => FINAL.has(info.status));
-			if (final) return this.completionEvent(final);
-		}
-		if (signal?.aborted) throw signal.reason;
-		return new Promise((resolveWait, rejectWait) => {
-			let waiter!: Waiter;
-			const onAbort = () => {
-				this.waiters = this.waiters.filter((entry) => entry !== waiter);
-				rejectWait(signal?.reason instanceof Error ? signal.reason : new Error("Wait cancelled."));
-			};
-			waiter = { parentSessionId, targets: normalized, resolve: (event) => {
-				signal?.removeEventListener("abort", onAbort);
-				resolveWait(event);
-			} };
-			this.waiters.push(waiter);
-			signal?.addEventListener("abort", onAbort, { once: true });
-		});
-	}
-
-	async waitAll(parentSessionId: string, targets: string[] | undefined, signal?: AbortSignal): Promise<{ infos?: AgentInfo[]; event?: MailEvent }> {
-		const names = targets?.length
-			? new Set(targets.map((target) => `/${normalizeTaskName(target)}`))
-			: new Set(this.defaultWaitTargets.get(parentSessionId) ?? []);
-		if (targets?.length) {
-			const known = this.readScope(parentSessionId);
-			const missing = [...names].filter((name) => !known.some((info) => info.canonicalName === name));
-			if (missing.length) throw new Error(`Agent not found in this parent session: ${missing.join(", ")}`);
-		}
-		const scope: WaitAllScope = { parentSessionId, targets: names };
-		this.waitAllScopes.add(scope);
-		try {
-			for (;;) {
-				if (signal?.aborted) throw signal.reason;
-				const permission = this.mailbox.claim(
-					(event) => event.kind === "permission" && event.parentSessionId === parentSessionId && names.has(event.agentName),
-					(event) => this.isPermissionPending(event),
-				);
-				if (permission) return { event: permission };
-				const infos = this.readScope(parentSessionId).filter((info) => names.has(info.canonicalName));
-				if (infos.every((info) => FINAL.has(info.status))) {
-					for (const info of infos) this.defaultWaitTargets.get(parentSessionId)?.delete(info.canonicalName);
-					this.mailbox.remove((event) =>
-						event.parentSessionId === parentSessionId && names.has(event.agentName) && event.kind === "completion"
-					);
-					return { infos };
-				}
-				await delay(250, undefined, signal ? { signal } : undefined);
-			}
-		} finally {
-			this.waitAllScopes.delete(scope);
-		}
-	}
-
-	async shutdown(): Promise<void> {
-		if (this.widgetTimer) clearInterval(this.widgetTimer);
-		this.widgetTimer = undefined;
-		this.ctx?.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined);
-		let ownedInfos: AgentInfo[] = [];
-		if (this.ctx) {
-			try { ownedInfos = this.readScope(this.parentSessionId(this.ctx)); } catch {}
-		}
-		for (const record of this.idleCloseTimers.values()) clearTimeout(record.timer);
-		this.idleCloseTimers.clear();
-		const lives = [...this.live.values()];
-		for (const live of lives) {
-			this.flushThought(live);
-			live.closing = true;
-			live.generation++;
-			live.pending = false;
-			if (live.info.status === "starting" || live.info.status === "running") {
-				live.info.status = "interrupted";
-				live.info.completedAt = this.now();
-				live.info.lastActivity = this.now();
-				this.terminalizeActiveTools(live, "interrupted");
-				this.appendLedger(live.info, { kind: "runtime", state: "interrupted", detail: "shutdown" });
-				this.appendLedger(live.info, { kind: "completion", status: "interrupted", summary: "shutdown" });
-				this.persist(live.info);
-			} else this.terminalizeActiveTools(live, "closed");
-		}
-		await Promise.allSettled(lives.map((live) => this.closeLive(live.info.id, true)));
-		const viewerInfos = new Map([...ownedInfos, ...lives.map((live) => live.info)].map((info) => [info.id, info]));
-		await Promise.allSettled([...viewerInfos.values()].map((info) => this.closeViewer(info)));
-		this.waiters = [];
-		this.controlQueues.clear();
-		this.stateListeners.clear();
-		this.lastSnapshots.clear();
-		this.ctx = undefined;
-		this.parentWorking = true;
-		this.reportParent(false, true);
-	}
-
-	reassertParent(): void {
-		if (![...this.live.values()].some((live) => live.pending)) return;
-		const timer = setTimeout(() => this.reportParent(true, true), 500);
-		timer.unref?.();
-	}
-
-	private async ensurePrerequisites(backend: AgentBackend, cwd: string): Promise<void> {
-		if (this.herdr) return this.herdr.ensure(backend, cwd);
-		if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) {
-			throw new Error("Subagents require Pi to run inside a Herdr workspace.");
-		}
-		const commands: Array<[string, string[]]> = [[resolveExecutable("herdr", process.env.HERDR_BIN), ["--version"]]];
-		if (backend === "cursor") commands.push([resolveExecutable("agent", process.env.CURSOR_AGENT_BIN), ["--version"]]);
-		else commands.push([piInvocation().command, ["--version"]]);
-		for (const [command, args] of commands) {
-			const result = await this.commandRunner(command, args, cwd, 5000);
-			if (result.code !== 0) throw new Error((result.stderr || `${command} is unavailable`).trim());
-		}
-	}
-
-	/** Runtime adapters receive fresh projections, never the mutable persisted AgentInfo record. */
-	private piRuntimeAgent(info: AgentInfo): PiRuntimeAgent {
-		return {
-			canonicalName: info.canonicalName, cwd: info.cwd, provider: info.provider, modelId: info.modelId,
-			thinking: info.thinking, tools: info.tools, skillPaths: info.skillPaths ? [...info.skillPaths] : undefined,
-			extensionPaths: info.extensionPaths ? [...info.extensionPaths] : undefined, sessionFile: info.sessionFile, logFile: info.logFile,
-		};
-	}
-
-	private herdrAgent(info: AgentInfo): HerdrAgent {
-		return {
-			id: info.id, canonicalName: info.canonicalName, backend: info.backend, cwd: info.cwd,
-			viewerPaneId: info.viewerPaneId, viewerTabId: info.viewerTabId,
-		};
-	}
-
-	private acceptsRuntimeTurn(live: RuntimeHandle): boolean {
-		return !live.closing && live.pending && !FINAL.has(live.info.status);
-	}
-
-	private async createViewer(info: AgentInfo): Promise<{ paneId: string; tabId: string }> {
-		if (this.herdr) return this.herdr.createViewer(this.herdrAgent(info));
-		this.initializeLedger(info);
-		const result = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), [
-			"tab", "create",
-			"--workspace", process.env.HERDR_WORKSPACE_ID!,
-			"--cwd", info.cwd,
-			"--label", `${info.taskName} [${info.backend}]`,
-			"--no-focus",
-		], info.cwd, 5000);
-		if (result.code !== 0) throw new Error((result.stderr || result.stdout || "herdr tab create failed").trim());
-		let parsed: any;
-		try { parsed = JSON.parse(result.stdout); } catch { throw new Error(`Unexpected Herdr output: ${result.stdout.trim()}`); }
-		const paneId = parsed.result?.root_pane?.pane_id;
-		const tabId = parsed.result?.tab?.tab_id ?? parsed.result?.root_pane?.tab_id;
-		if (!paneId || !tabId) throw new Error("Herdr did not return viewer pane/tab ids.");
-		const viewerCommand = buildRunLedgerViewerCommand({
-			nodeExecutable: process.execPath,
-			viewerPath: this.paths.viewerPath ?? RUN_LEDGER_VIEWER_PATH,
-			infoPath: info.infoFile,
-			journalPath: runLedgerJournalPath(info),
-			rawLogPath: info.logFile,
-		});
-		const viewer = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "run", paneId, viewerCommand], info.cwd, 5000);
-		if (viewer.code !== 0) throw new Error((viewer.stderr || viewer.stdout || "Could not start Run Ledger viewer").trim());
-		return { paneId, tabId };
-	}
-
-	private async closeViewer(info: AgentInfo): Promise<void> {
-		if (!info.viewerPaneId && !info.viewerTabId) return;
-		const existing = this.viewerClosures.get(info.id);
-		if (existing) return existing;
-		const viewer = this.herdrAgent(info);
-		delete info.viewerTabId;
-		delete info.viewerPaneId;
-		this.persist(info);
-		const close = (async () => {
-			if (this.herdr) {
-				await this.herdr.closeViewer(viewer);
-				return;
-			}
-			if (viewer.viewerTabId) {
-				const result = await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["tab", "close", viewer.viewerTabId], viewer.cwd, 5000);
-				if (result.code === 0) return;
-			}
-			if (viewer.viewerPaneId) await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "close", viewer.viewerPaneId], viewer.cwd, 5000);
-		})();
-		this.viewerClosures.set(info.id, close);
-		try { await close; }
-		finally { if (this.viewerClosures.get(info.id) === close) this.viewerClosures.delete(info.id); }
-	}
-
-	private async startRuntime(info: AgentInfo): Promise<RuntimeHandle> {
-		const existing = this.live.get(info.id);
-		if (existing) return existing;
-		if (info.backend === "cursor" && info.acpSessionId && info.acpCapabilities?.loadSession !== true) {
-			throw new Error(`Cursor ACP session ${info.acpSessionId} cannot reconnect because loadSession was not advertised.`);
-		}
-		if (!info.viewerPaneId || !info.viewerTabId) {
-			this.initializeLedger(info);
-			const viewer = await this.createViewer(info);
-			info.viewerPaneId = viewer.paneId;
-			info.viewerTabId = viewer.tabId;
-			this.persist(info);
-		}
-		const live: RuntimeHandle = {
-			info,
-			kind: info.backend,
-			pending: false,
-			closing: false,
-			generation: 0,
-			currentOutput: "",
-			phase: "Starting",
-			activeTools: new Map(),
-			thoughtChunks: 0,
-			thoughtCharacters: 0,
-			promptPermissionPending: false,
-			pendingApprovals: new Map(),
-		};
-		this.live.set(info.id, live);
-		try {
-			if (info.backend === "pi") {
-				live.pi = this.createPiRuntime(this.piRuntimeAgent(info), {
-					onEvent: (event) => this.handlePiEvent(live, event),
-					onExit: (error) => this.handleRuntimeExit(live, error),
-				});
-				await live.pi.start();
-			} else {
-				live.cursor = this.createCursorRuntime(info.cwd, {
-					onNotification: (message) => this.handleCursorNotification(live, message),
-					onRequest: (message) => this.handleCursorRequest(live, message),
-					onStderr: (text) => log(info, "cursor stderr", text.trimEnd()),
-					onExit: (code, signal) => this.handleRuntimeExit(live, new Error(`Cursor ACP exited (${code ?? signal ?? "unknown"}).`)),
-				});
-				const started = await this.withCursorConfig(() => live.cursor!.start(info.cursorModel ?? DEFAULT_CURSOR_MODEL, { sessionId: info.acpSessionId }));
-				info.acpSessionId = started.sessionId;
-				info.acpCapabilities = started.agentCapabilities;
-				log(info, "ACP", `${started.loaded ? "loaded" : "created"} ${started.sessionId}`);
-				this.persist(info);
-			}
-			this.appendLedger(info, { kind: "runtime", state: info.status, detail: "runtime ready" });
-			this.refresh();
-			return live;
+			this.initializeLedger(info); this.appendLedger(info, { kind: "runtime", state: "queued", detail: "turn queued" });
 		} catch (error) {
-			this.live.delete(info.id);
-			await live.pi?.close().catch(() => undefined);
-			await live.cursor?.close().catch(() => undefined);
-			await this.closeViewer(info).catch(() => undefined);
+			const message = error instanceof Error ? error.message : String(error);
+			this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "spawn-preparation-failed", error: message }));
 			throw error;
 		}
+		let createdViewer: { paneId: string; tabId: string } | undefined;
+		try {
+			createdViewer = await this.createViewer(info);
+			const updated = this.mutate(parent, (current) => updateAgentRuntimeResources(current, id, { viewerPaneId: createdViewer!.paneId, viewerTabId: createdViewer!.tabId }, this.now()));
+			info = this.project(updated).find((entry) => entry.id === id)!;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (createdViewer) await this.closeViewer({ ...info, viewerPaneId: createdViewer.paneId, viewerTabId: createdViewer.tabId }).catch(() => undefined);
+			try {
+				const failed = this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "viewer-create-failed", error: message }));
+				const failedInfo = this.project(failed).find((entry) => entry.id === id)!;
+				this.appendLedger(failedInfo, { kind: "error", message }); this.appendLedger(failedInfo, { kind: "completion", status: "failed", summary: message });
+			} catch { /* ownership may have changed; local viewer cleanup above is still required */ }
+			throw error;
+		}
+		const targets = this.defaultWaitTargets.get(parent) ?? new Set<string>(); targets.add(info.canonicalName); this.defaultWaitTargets.set(parent, targets); queueMicrotask(() => this.requestDrain(parent)); return info;
 	}
 
+	private requestDrain(parent: string): void { this.drainRequested.add(parent); if (this.draining.has(parent)) return; queueMicrotask(() => void this.drain(parent)); }
+	private async drain(parent: string): Promise<void> {
+		if (this.draining.has(parent)) return; this.draining.add(parent);
+		try {
+			while (this.drainRequested.delete(parent)) {
+				let admittedIds: string[] = [];
+				this.mutate(parent, (current) => {
+					const admission = admitFifo(current, this.now(), undefined, (turn) => !!current.agents[turn.agentId]?.viewerPaneId && !!current.agents[turn.agentId]?.viewerTabId);
+					admittedIds = admission.admitted;
+					return admission.manifest;
+				});
+				if (!admittedIds.length) break;
+				await Promise.all(admittedIds.map((turnId) => this.launchAdmitted(parent, turnId)));
+			}
+		}
+		finally { this.draining.delete(parent); if (this.drainRequested.has(parent)) void this.drain(parent); }
+	}
+	private matching(live: RuntimeHandle, requireRunning = true, turnToken?: string): boolean {
+		if (turnToken !== undefined && turnToken !== live.turnId) return false;
+		if (live.epoch !== this.epoch || this.live.get(live.info.id) !== live || live.closing) return false;
+		try {
+			const value = this.current(live.info.parentSessionId, live.info.id);
+			if (value.agent.currentTurnId !== live.turnId || value.turn?.ownerEpoch !== live.epoch) return false;
+			return requireRunning ? value.turn?.state === "running" : value.turn?.state === "admitted" || value.turn?.state === "running";
+		} catch { return false; }
+	}
 	private async withCursorConfig<T>(operation: () => Promise<T>): Promise<T> {
 		const previous = this.cursorConfigQueue;
 		let release!: () => void;
@@ -1430,527 +968,347 @@ class UnifiedManager {
 		const original = existed ? readFileSync(this.paths.cursorConfigPath, "utf8") : undefined;
 		try { return await operation(); }
 		finally {
-			await restoreCursorConfigVerified({
-				path: this.paths.cursorConfigPath,
-				existedBefore: existed,
-				originalContent: original,
-				fs: {
-					exists: existsSync,
-					read: (path) => readFileSync(path, "utf8"),
-					write: (path, content) => writeFileSync(path, content, "utf8"),
-					unlink: unlinkSync,
-				},
+			await restoreCursorConfigVerified({ path: this.paths.cursorConfigPath, existedBefore: existed, originalContent: original,
+				fs: { exists: existsSync, read: (path) => readFileSync(path, "utf8"), write: (path, content) => writeFileSync(path, content, "utf8"), unlink: unlinkSync },
 			}).finally(release);
 		}
 	}
+	private async launchAdmitted(parent: string, turnId: string): Promise<void> {
+		let item: ReturnType<UnifiedManager["current"]>;
+		try {
+			const manifest = this.manifest(parent);
+			const turn = manifest.turns[turnId];
+			if (!turn || turn.state !== "admitted" || turn.ownerEpoch !== this.epoch || manifest.agents[turn.agentId]?.currentTurnId !== turnId) return;
+			item = this.current(parent, turn.agentId);
+		} catch { return; }
+		const { agent, turn, info } = item;
+		if (!turn) return;
 
-	private async beginPrompt(info: AgentInfo, prompt: string, displayMessage: string): Promise<void> {
-		this.clearIdleClose(info.id);
-		this.clearCompletionMail(info);
-		const live = this.live.get(info.id) ?? await this.startRuntime(info);
-		if (live.pending) throw new Error(`Agent ${info.canonicalName} is already running.`);
-		live.pending = true;
-		live.generation++;
-		live.currentOutput = "";
-		live.candidateError = undefined;
-		live.phase = "Thinking";
-		this.terminalizeActiveTools(live, "interrupted");
-		live.promptPermissionPending = false;
-		const generation = live.generation;
-		info.status = "running";
-		info.turn++;
-		info.lastTaskMessage = displayMessage;
-		info.lastActivity = this.now();
-		delete info.finalResponse;
-		delete info.error;
-		delete info.completedAt;
-		try { unlinkSync(info.responseFile); } catch {}
-		this.flushThought(live);
-		this.appendLedger(info, { kind: "runtime", state: "running", detail: "turn started" });
-		this.appendLedger(info, { kind: "task", synopsis: displayMessage });
-		this.appendLedger(info, { kind: "phase", name: "Thinking" });
-		this.persist(info);
-		log(info, "user", displayMessage);
-		this.refresh();
-		if (info.backend === "pi") {
-			try { await live.pi!.prompt(prompt); }
-			catch (error) { if (live.generation === generation) this.finalize(live, "failed", "", error instanceof Error ? error.message : String(error)); throw error; }
-			return;
-		}
-		void live.cursor!.prompt(prompt).then((result) => {
-			if (live.closing || live.generation !== generation) return;
-			if (live.queuedCursorMessage) {
-				const next = live.queuedCursorMessage;
-				live.queuedCursorMessage = undefined;
-				live.pending = false;
-				void this.beginPrompt(info, next, next).catch((error) => this.finalize(live, "failed", "", error instanceof Error ? error.message : String(error)));
-				return;
-			}
-			this.finalize(live, live.candidateError ? "failed" : "completed", live.currentOutput, live.candidateError ?? (result.stopReason === "error" ? "Cursor prompt failed." : undefined));
-		}).catch((error) => {
-			if (live.closing || live.generation !== generation) return;
-			if (live.queuedCursorMessage) {
-				const next = live.queuedCursorMessage;
-				live.queuedCursorMessage = undefined;
-				live.pending = false;
-				void this.beginPrompt(info, next, next).catch((nextError) => this.finalize(live, "failed", "", nextError instanceof Error ? nextError.message : String(nextError)));
-				return;
-			}
-			this.finalize(live, "failed", live.currentOutput, error instanceof Error ? error.message : String(error));
-		});
-	}
-
-	private handlePiEvent(live: RuntimeHandle, event: any): void {
-		if (!this.acceptsRuntimeTurn(live)) return;
-		if (event.type === "text") {
-			this.flushThought(live);
-			live.currentOutput += event.text;
-			this.setPhase(live, "Writing response");
-			log(live.info, "assistant", event.text);
-		} else if (event.type === "thought") {
-			this.setPhase(live, "Thinking");
-			this.bufferThought(live, event.text);
-			log(live.info, "thought", event.text);
-		} else if (event.type === "tool_start") {
-			this.flushThought(live);
-			this.mutateActivity(live, () => live.activeTools.set(event.id, compactActivityText(event.name, 80) || "tool"));
-			this.appendLedger(live.info, { kind: "tool-start", id: event.id, name: event.name, input: event.input });
-			log(live.info, "tool", event.name);
-		} else if (event.type === "tool_update") {
-			this.flushThought(live);
-			if (live.activeTools.has(event.id)) this.appendLedger(live.info, { kind: "tool-update", id: event.id, status: event.status, count: event.partialResult === undefined ? undefined : opaqueToolValueCount(event.partialResult) });
-			else this.appendLedger(live.info, { kind: "phase", name: "Observed Pi tool update", detail: event.id });
-		} else if (event.type === "tool_end") {
-			this.flushThought(live);
-			if (live.activeTools.has(event.id)) {
-				this.mutateActivity(live, () => { live.activeTools.delete(event.id); if (live.activeTools.size === 0) live.phase = "Thinking"; });
-				this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status, result: event.result, isError: event.isError });
-			} else this.appendLedger(live.info, { kind: "phase", name: "Observed Pi tool end", detail: event.id });
-		} else if (event.type === "tool_observed") {
-			this.flushThought(live); this.appendLedger(live.info, { kind: "phase", name: event.phase });
-		} else if (event.type === "phase") {
-			this.setPhase(live, event.phase);
-		} else if (event.type === "settled" && live.pending) {
-			this.flushThought(live);
-			this.finalize(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error);
-		}
-		live.info.lastActivity = this.now();
-		this.persist(live.info);
-	}
-
-	private handleCursorNotification(live: RuntimeHandle, message: JsonRpcMessage): void {
-		if (!this.acceptsRuntimeTurn(live)) return;
-		if (message.method === "session/update") {
-			const update = message.params?.update;
-			const kind = update?.sessionUpdate;
-			if (kind === "agent_message_chunk") {
-				const text = contentText(update.content); this.flushThought(live); live.currentOutput += text;
-				this.setPhase(live, "Writing response"); log(live.info, "assistant", text);
-			} else if (kind === "agent_thought_chunk") {
-				const text = contentText(update.content); this.setPhase(live, "Thinking"); this.bufferThought(live, text); log(live.info, "thought", text);
-			} else if (kind === "tool_call" || kind === "tool_call_update") {
-				this.flushThought(live);
-				const tool = normalizeCursorToolUpdate(update);
-				if (tool?.type === "tool_start") {
-					this.mutateActivity(live, () => live.activeTools.set(tool.id, compactActivityText(tool.name, 80) || "tool"));
-					this.appendLedger(live.info, { kind: "tool-start", id: tool.id, name: tool.name, input: tool.input });
-				} else if (tool?.type === "tool_update") {
-					if (live.activeTools.has(tool.id)) this.appendLedger(live.info, { kind: "tool-update", id: tool.id, status: tool.status, count: tool.partialResult === undefined ? undefined : opaqueToolValueCount(tool.partialResult) });
-					else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool update", detail: tool.id });
-				} else if (tool?.type === "tool_end") {
-					if (live.activeTools.has(tool.id)) {
-						this.mutateActivity(live, () => { live.activeTools.delete(tool.id); if (live.activeTools.size === 0) live.phase = "Thinking"; });
-						this.appendLedger(live.info, { kind: "tool-end", id: tool.id, status: tool.status, result: tool.result, isError: tool.isError });
-					} else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool end", detail: tool.id });
-				} else if (tool?.type === "tool_observed") this.appendLedger(live.info, { kind: "phase", name: tool.phase });
-				const title = compactActivityText(update.title ?? update.toolCall?.title ?? update.toolCall?.name ?? "tool", 80) || "tool";
-				log(live.info, "tool", title);
-			} else if (kind) log(live.info, kind, JSON.stringify(update).slice(0, 2000));
-		} else if (message.method === "cursor/update_todos") {
-			log(live.info, "todos", JSON.stringify(message.params?.todos ?? []).slice(0, 2000));
-		} else log(live.info, message.method ?? "notification", JSON.stringify(message.params ?? {}).slice(0, 2000));
-		live.info.lastActivity = this.now(); this.persist(live.info);
-	}
-
-	private async handleCursorRequest(live: RuntimeHandle, message: JsonRpcMessage): Promise<unknown> {
-		if (!this.acceptsRuntimeTurn(live)) {
-			// Permission needs a protocol-valid rejection; every other late request becomes an ACP RPC error.
-			if (message.method === "session/request_permission") return this.handlePermission(live, message.params);
-			throw new Error(`Cursor request received for an inactive subagent turn: ${message.method}`);
-		}
-		if (message.method === "session/request_permission") return this.handlePermission(live, message.params);
-		if (message.method === "cursor/create_plan") return { outcome: { outcome: "accepted" } };
-		if (message.method === "cursor/ask_question") {
-			return skippedAskQuestion("Unified ACP agents do not fabricate interactive answers.");
-		}
-		throw new Error(`Unsupported Cursor ACP request: ${message.method}`);
-	}
-
-	private async handlePermission(live: RuntimeHandle, params: unknown): Promise<unknown> {
-		const options = normalizePermissionOptions(params);
-		// ACP can race cancellation; terminal/nonpending turns must not allocate mail, timers, or state.
-		if (!this.acceptsRuntimeTurn(live)) return rejectPermissionResult(options);
-		const summary = redactPermissionPayload(params);
-		const mode = live.info.permissionMode ?? "agent";
-		this.flushThought(live);
-		log(live.info, "permission", summary);
-		this.appendLedger(live.info, { kind: "permission", status: "pending", summary });
-		if (mode === "allow-once" || mode === "deny") {
-			const result = resolveAutomaticPermission(mode, options);
-			this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
-			return result;
-		}
-		if (mode === "prompt") {
-			const ctx = this.ctx;
-			if (!ctx?.hasUI) {
-				const result = rejectPermissionResult(options);
-				this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
-				return result;
-			}
-			live.promptPermissionPending = true;
-			this.publishState(live.info.parentSessionId);
-			this.updateWidget();
-			try {
-				const labels = permissionSelectLabels(options);
-				const selected = await ctx.ui.select(`Cursor ${live.info.canonicalName} — ${summary}`, labels, { timeout: PERMISSION_TIMEOUT_MS });
-				const result = resolvePromptPermissionSelection(options, selected ?? undefined);
-				this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
-				return result;
-			} finally {
-				live.promptPermissionPending = false;
-				this.publishState(live.info.parentSessionId);
-				this.updateWidget();
-			}
-		}
-		const approvalId = this.uuid().slice(0, 8);
-		const allowOnceOffered = !!findPermissionOptionId(options, ALLOW_ONCE_IDS);
-		return new Promise((resolvePermission) => {
-			const timer = setTimeout(() => {
-				const pending = live.pendingApprovals.get(approvalId);
-				if (!pending) return;
-				this.settleApproval(
-					live,
-					pending,
-					() => rejectPermissionResult(options),
-					`${approvalId} timed out and was rejected`,
-					"expired",
-				);
-				this.updateWidget();
-			}, PERMISSION_TIMEOUT_MS);
-			timer.unref?.();
-			live.pendingApprovals.set(approvalId, { id: approvalId, summary, options, resolve: resolvePermission, timer });
-			this.publishState(live.info.parentSessionId);
-			this.updateWidget();
-			this.pushMail({
-				id: this.uuid(),
-				parentSessionId: live.info.parentSessionId,
-				agentName: live.info.canonicalName,
-				kind: "permission",
-				status: "running",
-				approvalId,
-				summary,
-				allowOnceOffered,
-				createdAt: this.now(),
-			});
-		});
-	}
-
-	private finalize(live: RuntimeHandle, status: "completed" | "failed", output: string, error?: string): void {
-		if (live.closing || !live.pending) return;
-		live.pending = false;
-		this.flushThought(live);
-		this.terminalizeActiveTools(live, finalizeActiveToolStatus(status));
-		this.rejectApprovals(live, false, "agent completed");
-		live.promptPermissionPending = false;
-		live.info.status = status;
-		live.info.finalResponse = output;
-		live.info.error = error;
-		live.info.completedAt = this.now();
-		live.info.lastActivity = this.now();
-		if (live.info.finalResponse) writePrivate(live.info.responseFile, live.info.finalResponse);
-		log(live.info, "turn", error ? `failed: ${error}` : "completed");
-		if (error) this.appendLedger(live.info, { kind: "error", message: error });
-		if (live.info.finalResponse) this.appendLedger(live.info, { kind: "response", text: live.info.finalResponse });
-		this.appendLedger(live.info, { kind: "runtime", state: status });
-		this.appendLedger(live.info, { kind: "completion", status, summary: error ?? live.info.finalResponse });
-		this.persist(live.info);
-		this.pushMail(this.completionEvent(live.info));
-		this.scheduleIdleClose(live.info);
-		this.refresh();
-	}
-
-	private completionEvent(info: AgentInfo): MailEvent {
-		return {
-			id: this.uuid(),
-			parentSessionId: info.parentSessionId,
-			agentName: info.canonicalName,
-			kind: "completion",
-			status: info.status,
-			finalResponse: info.finalResponse,
-			error: info.error,
-			createdAt: this.now(),
+		// A settled process is deliberately retained for follow-up turns. Its callbacks close
+		// over this same handle, whose turn identity is replaced before dispatch.
+		const retained = this.live.get(agent.id);
+		// Idle processes are retained only until a distinct turn is actually dispatched. Retire
+		// them here so every turn owns an immutable handle and late callbacks cannot cross turns.
+		if (retained && !retained.pending) await this.discardFreshRuntime(retained);
+		const live: RuntimeHandle = {
+			info, kind: agent.backend, turnId, epoch: this.epoch, pi: undefined, cursor: undefined,
+			pending: true, closing: false, generation: 1, currentOutput: "", phase: "Starting",
+			activeTools: new Map(), thoughtChunks: 0, thoughtCharacters: 0, promptPermissionPending: false, pendingApprovals: new Map(),
 		};
-	}
+		this.live.set(agent.id, live);
 
-	private pushMail(event: MailEvent, notifyParent = true): void {
-		if (event.kind === "permission" && !this.isPermissionPending(event)) return;
-		if (event.kind === "completion") {
-			this.mailbox.remove((old) => old.kind === "completion"
-				&& old.parentSessionId === event.parentSessionId && old.agentName === event.agentName);
+		try {
+			if (agent.backend === "pi") {
+				live.pi = this.createPiRuntime(this.piRuntimeAgent(agent), {
+					onEvent: (event, token) => this.handlePiEvent(live, event, token),
+					onExit: (error) => this.handleRuntimeExit(live, error),
+				});
+				await live.pi.start();
+			} else if (!live.cursor) {
+				live.cursor = this.createCursorRuntime(agent.cwd, {
+					onNotification: (message, token) => this.handleCursorNotification(live, message, token),
+					onRequest: (message, token) => this.handleCursorRequest(live, message, token),
+					onStderr: (text) => log(info, "cursor stderr", text.trimEnd()),
+					onExit: (code, signal) => this.handleRuntimeExit(live, new Error(`Cursor ACP exited (${code ?? signal ?? "unknown"}).`)),
+				});
+				const started = await this.withCursorConfig(() => live.cursor!.start(agent.cursorModel as CursorModel ?? DEFAULT_CURSOR_MODEL, { sessionId: agent.acpSessionId }));
+				if (!this.matching(live, false)) { await this.discardFreshRuntime(live); return; }
+				this.mutate(parent, (current) => updateAgentRuntimeResources(current, agent.id, { acpSessionId: started.sessionId, acpCapabilities: started.agentCapabilities }, this.now()));
+			}
+			if (!this.matching(live, false)) { await this.discardFreshRuntime(live); return; }
+			this.mutate(parent, (current) => {
+				const currentTurn = current.turns[turnId];
+				if (!currentTurn || current.agents[agent.id]?.currentTurnId !== turnId || currentTurn.state !== "admitted" || currentTurn.ownerEpoch !== this.epoch) return current;
+				return transitionTurn(current, turnId, "running", this.now());
+			});
+			if (!this.matching(live)) { await this.discardFreshRuntime(live); return; }
+			live.info = this.current(parent, agent.id).info;
+			this.appendLedger(live.info, { kind: "runtime", state: "running", detail: "turn admitted" });
+			this.appendLedger(live.info, { kind: "task", synopsis: turn.execution.displayMessage });
+			log(live.info, "user", turn.execution.displayMessage);
+			this.refresh();
+			if (agent.backend === "pi") await live.pi!.prompt(turn.execution.prompt, turnId);
+			else {
+				const generation = live.generation;
+				const promise = live.cursor!.prompt(turn.execution.prompt, turnId);
+				live.turnPromise = promise;
+				void promise.then((result) => this.finishCursor(live, result.stopReason === "error" ? "Cursor prompt failed." : undefined, generation))
+					.catch((error) => this.finishCursor(live, error instanceof Error ? error.message : String(error), generation));
+			}
+		} catch (error) {
+			if (this.matching(live, false)) this.terminal(live, "failed", "", error instanceof Error ? error.message : String(error));
+			await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]); if (this.live.get(agent.id) === live) this.live.delete(agent.id);
 		}
-		const waiterIndex = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName)));
-		if (waiterIndex >= 0) {
-			const [waiter] = this.waiters.splice(waiterIndex, 1);
-			waiter!.resolve(event);
-			return;
+	}
+	private async discardFreshRuntime(live: RuntimeHandle): Promise<void> {
+		if (this.live.get(live.info.id) === live) this.live.delete(live.info.id);
+		live.closing = true; live.pending = false;
+		await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]);
+	}
+	private finishCursor(live: RuntimeHandle, error?: string, generation = live.generation): void { if (generation !== live.generation || !this.matching(live)) return; this.terminal(live, error ? "failed" : "completed", live.currentOutput, error); }
+
+	async send(parent: string, target: string, message: string): Promise<{ delivery: "steer" | "cancel-and-prompt" | "prompt"; turnId: string }> {
+		const info = this.get(target, parent); return this.enqueueControl(info.id, () => this.sendNow(parent, target, message));
+	}
+	async interrupt(parent: string, target: string): Promise<AgentStatus> {
+		const info = this.get(target, parent); return this.enqueueControl(info.id, () => this.interruptNow(parent, target));
+	}
+	async close(parent: string, target: string): Promise<AgentStatus> {
+		const info = this.get(target, parent); return this.enqueueControl(info.id, () => this.closeNow(parent, target));
+	}
+	private async sendNow(parent: string, target: string, message: string): Promise<{ delivery: "steer" | "cancel-and-prompt" | "prompt"; turnId: string }> {
+		const info = this.get(target, parent); const item = this.current(parent, info.id); const turn = item.turn; if (item.agent.closed) throw new Error(`Agent is closed: ${info.canonicalName}`); if (!turn) throw new Error(`Agent has no current turn: ${info.canonicalName}`); if (turn.state === "queued" || turn.state === "admitted") throw new Error(`Agent ${info.canonicalName} has a queued or admitted turn and cannot receive another message.`);
+		if (turn.state === "running") {
+			const live = this.live.get(info.id); if (!live || !this.matching(live)) throw new Error(`Agent ${info.canonicalName} runtime is unavailable.`);
+			if (item.agent.backend === "pi") { await live.pi!.steer(message); this.setPhase(live, "Applying parent correction"); this.touch(live); log(live.info, "steer", message); return { delivery: "steer", turnId: turn.id }; }
+			const successor = this.uuid();
+			const next = this.mutate(parent, (current) => replaceCursorTurn(current, turn.id, successor, this.execution(current.agents[info.id]!, message, message), this.now()));
+			this.clearCompletionMail(parent, info.canonicalName);
+			this.rejectApprovals(live, true, "active Cursor turn interrupted");
+			const oldPrompt = live.turnPromise;
+			live.closing = true; live.pending = false; this.live.delete(info.id);
+			this.appendLedger(this.project(next).find((entry) => entry.id === info.id)!, { kind: "runtime", state: "interrupted", detail: "parent corrected" });
+			live.cursor!.cancel();
+			// ACP cancellation can leave its prompt request unresolved. Bound the acknowledgement
+			// wait, then force-close this process and reconnect the successor via session/load.
+			if (oldPrompt) await Promise.race([oldPrompt.catch(() => undefined), delay(CURSOR_CANCEL_TIMEOUT_MS)]);
+			await this.discardFreshRuntime(live);
+			await this.launchAdmitted(parent, successor);
+			return { delivery: "cancel-and-prompt", turnId: successor };
 		}
-		this.mailbox.push(event);
-		const observedByWaitAll = [...this.waitAllScopes].some((scope) =>
-			scope.parentSessionId === event.parentSessionId && scope.targets.has(event.agentName)
-		);
-		if (notifyParent && !observedByWaitAll) this.notifyParent(event);
-	}
-
-	private notifyParent(event: MailEvent): void {
-		if (event.kind === "permission") {
-			this.pi.sendMessage({
-				customType: "bstn_subagent_permission",
-				content: [
-					`Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`,
-					`Call respond_agent_permission with target=${JSON.stringify(event.agentName)}, approval_id=${JSON.stringify(event.approvalId)}, and decision=approve or reject. Then call wait_agent again if its result is still needed.`,
-				].join("\n"),
-				display: true,
-				details: { ...event },
-			}, { triggerTurn: true, deliverAs: "followUp" });
-			return;
+		const id = this.uuid();
+		let next = this.mutate(parent, (current) => enqueueTurn(current, { id, agentId: info.id, source: "follow-up", execution: this.execution(current.agents[info.id]!, message, message), createdAt: this.now(), ownerEpoch: this.epoch }));
+		let updated = this.project(next).find((entry) => entry.id === info.id)!;
+		// Reconciled work never resumes through its old tab. Explicit new work receives a fresh
+		// queued viewer only after the stale resource is closed and its IDs are durably cleared.
+		const staleViewer = info.status === "paused" || info.terminalReason === "restart-interrupted";
+		if (staleViewer && (info.viewerPaneId || info.viewerTabId)) {
+			await this.closeViewer(info).catch(() => undefined);
+			next = this.mutate(parent, (current) => updateAgentRuntimeResources(current, info.id, { viewerPaneId: null, viewerTabId: null }, this.now()));
+			updated = this.project(next).find((entry) => entry.id === info.id)!;
 		}
-		const info = this.get(event.agentName, event.parentSessionId);
-		const output = boundedResult(event.finalResponse ?? event.error ?? "", info);
-		this.pi.sendMessage({
-			customType: "bstn_subagent_completion",
-			content: [
-				`Subagent ${event.agentName} [${info.backend}] reached ${event.status}.`,
-				"Its result is included below; do not call wait_agent for this completed turn.",
-				"",
-				output.text,
-			].join("\n"),
-			display: true,
-			details: { ...event, backend: info.backend, output: output.text, truncated: output.truncated, fullOutputPath: output.fullOutputPath },
-		}, { triggerTurn: true, deliverAs: "followUp" });
-	}
-
-	private permissionMailKey(live: RuntimeHandle, approvalId: string): PermissionMailKey {
-		return { parentSessionId: live.info.parentSessionId, agentName: live.info.canonicalName, approvalId };
-	}
-
-	private isPermissionPending(event: MailEvent): boolean {
-		if (event.kind !== "permission" || !event.approvalId) return false;
-		return [...this.live.values()].some((live) =>
-			live.info.parentSessionId === event.parentSessionId
-			&& live.info.canonicalName === event.agentName
-			&& live.pendingApprovals.has(event.approvalId!)
-		);
-	}
-
-	private settleApproval<T>(live: RuntimeHandle, approval: PendingApproval, resolveDecision: () => T, note: string, terminalReason?: "expired" | "cancelled"): T {
-		const decision = resolveAndSettlePermission(
-			this.mailbox,
-			this.permissionMailKey(live, approval.id),
-			resolveDecision,
-			(decision) => {
-				clearTimeout(approval.timer);
-				live.pendingApprovals.delete(approval.id);
-				approval.resolve(decision);
-			},
-		);
-		log(live.info, "permission", note);
-		const result = decision as PermissionResult;
-		this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result, terminalReason), summary: approval.summary });
-		this.publishState(live.info.parentSessionId);
-		return decision;
-	}
-
-	private rejectApprovals(live: RuntimeHandle, cancelled: boolean, reason: string): void {
-		const hadApprovals = live.pendingApprovals.size > 0 || live.promptPermissionPending;
-		for (const approval of [...live.pendingApprovals.values()]) {
-			this.settleApproval(
-				live,
-				approval,
-				() => cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options),
-				`${approval.id} ${cancelled ? "cancelled" : "rejected"}: ${reason}`,
-				cancelled ? "cancelled" : undefined,
-			);
+		if (!updated.viewerPaneId || !updated.viewerTabId) {
+			let createdViewer: { paneId: string; tabId: string } | undefined;
+			try {
+				createdViewer = await this.createViewer(updated);
+				next = this.mutate(parent, (current) => updateAgentRuntimeResources(current, info.id, { viewerPaneId: createdViewer!.paneId, viewerTabId: createdViewer!.tabId }, this.now()));
+				updated = this.project(next).find((entry) => entry.id === info.id)!;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (createdViewer) await this.closeViewer({ ...updated, viewerPaneId: createdViewer.paneId, viewerTabId: createdViewer.tabId }).catch(() => undefined);
+				try {
+					const failed = this.mutate(parent, (current) => transitionTurn(current, id, "terminal", this.now(), { status: "failed", reason: "viewer-create-failed", error: message }));
+					const failedInfo = this.project(failed).find((entry) => entry.id === info.id)!;
+					this.appendLedger(failedInfo, { kind: "error", message }); this.appendLedger(failedInfo, { kind: "runtime", state: "failed" }); this.appendLedger(failedInfo, { kind: "completion", status: "failed", summary: message });
+				} catch {}
+				this.requestDrain(parent); throw error;
+			}
 		}
-		live.promptPermissionPending = false;
-		if (hadApprovals) {
-			this.publishState(live.info.parentSessionId);
-			this.updateWidget();
+		this.clearIdleClose(info.id); this.clearCompletionMail(parent, updated.canonicalName);
+		this.appendLedger(updated, { kind: "runtime", state: "queued", detail: "follow-up queued" });
+		const targets = this.defaultWaitTargets.get(parent) ?? new Set<string>(); targets.add(updated.canonicalName); this.defaultWaitTargets.set(parent, targets);
+		this.requestDrain(parent); return { delivery: "prompt", turnId: id };
+	}
+	private async interruptNow(parent: string, target: string): Promise<AgentStatus> {
+		const info = this.get(target, parent); const { turn } = this.current(parent, info.id); const previous = info.status;
+		if (!turn || turn.state === "terminal") return previous;
+		const next = this.mutate(parent, (current) => transitionTurn(current, turn.id, "terminal", this.now(), { status: "interrupted", reason: "agent-interrupted" }));
+		const live = this.live.get(info.id);
+		if (live) {
+			live.pending = false; live.closing = true;
+			this.flushThought(live); this.terminalizeActiveTools(live, "interrupted");
+			this.rejectApprovals(live, true, "agent interrupted");
+			try { if (live.kind === "pi") await live.pi!.abort(); else live.cursor!.cancel(); } catch {}
+			await this.discardFreshRuntime(live);
 		}
+		const updated = this.project(next).find((entry) => entry.id === info.id)!;
+		this.appendLedger(updated, { kind: "runtime", state: "interrupted" });
+		this.appendLedger(updated, { kind: "completion", status: "interrupted", summary: "agent interrupted" });
+		this.pushMail(this.completionEvent(updated)); this.scheduleIdleClose(updated); this.requestDrain(parent); return previous;
+	}
+	private async closeNow(parent: string, target: string): Promise<AgentStatus> {
+		const info = this.get(target, parent); const previous = info.status; if (previous === "closed") return previous;
+		const next = this.mutate(parent, (current) => closeManifestAgent(current, info.id, "agent-closed", this.now()));
+		const updated = this.project(next).find((entry) => entry.id === info.id)!; const live = this.live.get(info.id);
+		if (live) {
+			live.closing = true; live.pending = false; this.flushThought(live); this.terminalizeActiveTools(live, "closed"); this.rejectApprovals(live, true, "agent closed");
+			try { if (live.kind === "pi") await live.pi!.abort(); else live.cursor!.cancel(); } catch {}
+			await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]);
+			this.live.delete(info.id);
+		}
+		this.appendLedger(updated, { kind: "runtime", state: "closed" }); this.appendLedger(updated, { kind: "completion", status: "closed", summary: "agent closed" });
+		await this.closeViewer(updated).catch(() => undefined);
+		this.mutate(parent, (current) => updateAgentRuntimeResources(current, info.id, { viewerPaneId: null, viewerTabId: null }, this.now()));
+		this.pushMail(this.completionEvent(updated), false); this.requestDrain(parent); return previous;
+	}
+
+	private touch(live: RuntimeHandle, force = false): void {
+		if (!this.matching(live)) return;
+		const now = this.now();
+		const key = `${live.epoch}:${live.turnId}`;
+		if (!force && now - (this.lastActivityCommit.get(key) ?? 0) < 250) { this.publishState(live.info.parentSessionId); return; }
+		try {
+			this.mutate(live.info.parentSessionId, (current) => touchTurn(current, live.turnId, now));
+			this.lastActivityCommit.set(key, now); live.info = this.current(live.info.parentSessionId, live.info.id).info;
+		} catch {}
+	}
+	private terminal(live: RuntimeHandle, requestedStatus: "completed" | "failed", output: string, requestedError?: string): void {
+		if (!this.matching(live, false)) return;
+		let status = requestedStatus; let error = requestedError; let response: { turnId: string; path: string } | undefined;
+		if (output) {
+			try { writePrivate(live.info.responseFile, output); response = { turnId: live.turnId, path: live.info.responseFile }; }
+			catch (writeError) { status = "failed"; error = `response-write-failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`; output = ""; }
+		}
+		this.touch(live, true); live.pending = false; this.flushThought(live);
+		this.terminalizeActiveTools(live, finalizeActiveToolStatus(status)); this.rejectApprovals(live, false, "agent completed");
+		let next: ParentManifestV1;
+		try {
+			next = this.mutate(live.info.parentSessionId, (current) => {
+				const turn = current.turns[live.turnId];
+				if (!turn || current.agents[live.info.id]?.currentTurnId !== live.turnId || (turn.state !== "running" && turn.state !== "admitted") || turn.ownerEpoch !== live.epoch) return current;
+				return transitionTurn(current, live.turnId, "terminal", this.now(), { status, reason: error?.startsWith("response-write-failed:") ? "response-write-failed" : undefined, error, response });
+			});
+		} catch { return; }
+		const info = this.project(next).find((entry) => entry.id === live.info.id)!; live.info = info;
+		if (error) this.appendLedger(info, { kind: "error", message: error });
+		if (output) this.appendLedger(info, { kind: "response", text: output });
+		this.appendLedger(info, { kind: "runtime", state: status }); this.appendLedger(info, { kind: "completion", status, summary: error ?? output });
+		this.pushMail(this.completionEvent(info)); this.scheduleIdleClose(info); this.requestDrain(info.parentSessionId);
 	}
 
 	private handleRuntimeExit(live: RuntimeHandle, error?: Error): void {
-		if (live.closing) return;
+		if (this.live.get(live.info.id) !== live) return;
+		if (this.matching(live)) this.terminal(live, "failed", live.currentOutput, error?.message ?? "Subagent runtime exited unexpectedly.");
+		// An idle process can exit between turns; never retain a dead handle.
 		this.live.delete(live.info.id);
-		const wasPending = live.pending;
-		live.pending = false;
-		this.flushThought(live);
-		this.terminalizeActiveTools(live, "failed");
-		this.rejectApprovals(live, false, "runtime exited");
-		if (wasPending && !FINAL.has(live.info.status)) {
-			live.info.status = "failed";
-			live.info.error = error?.message ?? "Subagent runtime exited unexpectedly.";
-			live.info.completedAt = this.now();
-			live.info.lastActivity = this.now();
-			this.flushThought(live);
-			this.appendLedger(live.info, { kind: "error", message: live.info.error });
-			this.appendLedger(live.info, { kind: "runtime", state: "failed" });
-			this.appendLedger(live.info, { kind: "completion", status: "failed", summary: live.info.error });
-			this.persist(live.info);
-			this.pushMail(this.completionEvent(live.info));
-			this.scheduleIdleClose(live.info);
+	}
+	private handlePiEvent(live: RuntimeHandle, event: any, turnToken?: string): void { if (!turnToken || !this.matching(live, true, turnToken)) return; if (event.type === "text") { this.flushThought(live); live.currentOutput += event.text; this.setPhase(live, "Writing response"); log(live.info, "assistant", event.text); } else if (event.type === "thought") { this.setPhase(live, "Thinking"); this.bufferThought(live, event.text); log(live.info, "thought", event.text); } else if (event.type === "tool_start") { this.flushThought(live); live.activeTools.set(event.id, compactActivityText(event.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: event.id, name: event.name, input: event.input }); } else if (event.type === "tool_update") { if (live.activeTools.has(event.id)) this.appendLedger(live.info, { kind: "tool-update", id: event.id, status: event.status, count: opaqueToolValueCount(event.partialResult) }); } else if (event.type === "tool_end") { live.activeTools.delete(event.id); this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status, result: event.result, isError: event.isError }); } else if (event.type === "tool_observed") { this.appendLedger(live.info, { kind: "phase", name: event.phase }); } else if (event.type === "phase") this.setPhase(live, event.phase); else if (event.type === "settled") this.terminal(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error); this.touch(live); }
+	private handleCursorNotification(live: RuntimeHandle, message: JsonRpcMessage, turnToken?: string): void {
+		if (!turnToken || !this.matching(live, true, turnToken)) return;
+		if (message.method === "session/update") {
+			const update = message.params?.update; const kind = update?.sessionUpdate;
+			if (kind === "agent_message_chunk") { const text = contentText(update.content); live.currentOutput += text; this.setPhase(live, "Writing response"); log(live.info, "assistant", text); }
+			else if (kind === "agent_thought_chunk") { const text = contentText(update.content); this.setPhase(live, "Thinking"); this.bufferThought(live, text); }
+			else if (kind === "tool_call" || kind === "tool_call_update") {
+				const tool = normalizeCursorToolUpdate(update);
+				if (tool?.type === "tool_start") { live.activeTools.set(tool.id, compactActivityText(tool.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: tool.id, name: tool.name, input: tool.input }); }
+				else if (tool?.type === "tool_update") { if (live.activeTools.has(tool.id)) this.appendLedger(live.info, { kind: "tool-update", id: tool.id, status: tool.status, count: opaqueToolValueCount(tool.partialResult) }); else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool update", detail: tool.id }); }
+				else if (tool?.type === "tool_end") { live.activeTools.delete(tool.id); this.appendLedger(live.info, { kind: "tool-end", id: tool.id, status: tool.status, result: tool.result, isError: tool.isError }); }
+				else if (tool?.type === "tool_observed") this.appendLedger(live.info, { kind: "phase", name: tool.phase });
+			}
 		}
-		this.refresh();
+		this.touch(live);
 	}
-
-	private clearCompletionMail(info: AgentInfo): void {
-		this.mailbox.remove((event) => event.kind === "completion"
-			&& event.parentSessionId === info.parentSessionId && event.agentName === info.canonicalName);
+	private async handleCursorRequest(live: RuntimeHandle, message: JsonRpcMessage, turnToken?: string): Promise<unknown> { if (!turnToken || !this.matching(live, true, turnToken)) { if (message.method === "session/request_permission") return rejectPermissionResult(normalizePermissionOptions(message.params)); throw new Error(`Cursor request received for an inactive subagent turn: ${message.method}`); } if (message.method === "session/request_permission") return this.handlePermission(live, message.params); if (message.method === "cursor/create_plan") return { outcome: { outcome: "accepted" } }; if (message.method === "cursor/ask_question") return skippedAskQuestion("Unified ACP agents do not fabricate interactive answers."); throw new Error(`Unsupported Cursor ACP request: ${message.method}`); }
+	private async handlePermission(live: RuntimeHandle, params: unknown): Promise<unknown> {
+		const options = normalizePermissionOptions(params);
+		if (!this.matching(live)) return rejectPermissionResult(options);
+		const summary = redactPermissionPayload(params); const mode = live.info.permissionMode ?? "agent";
+		this.flushThought(live); this.appendLedger(live.info, { kind: "permission", status: "pending", summary });
+		if (mode === "allow-once" || mode === "deny") {
+			const result = resolveAutomaticPermission(mode, options);
+			this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary }); return result;
+		}
+		if (mode === "prompt") {
+			const ctx = this.ctx;
+			if (!ctx?.hasUI) { const result = rejectPermissionResult(options); this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary }); return result; }
+			live.promptPermissionPending = true; this.publishState(live.info.parentSessionId); this.updateWidget();
+			try { const result = resolvePromptPermissionSelection(options, await ctx.ui.select(`Cursor ${live.info.canonicalName} — ${summary}`, permissionSelectLabels(options), { timeout: PERMISSION_TIMEOUT_MS })); this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary }); return result; }
+			finally { live.promptPermissionPending = false; this.publishState(live.info.parentSessionId); this.updateWidget(); }
+		}
+		const approvalId = this.uuid().slice(0, 8);
+		return new Promise((resolvePermission) => {
+			const timer = setTimeout(() => { const pending = live.pendingApprovals.get(approvalId); if (pending) this.settleApproval(live, pending, () => rejectPermissionResult(options), `${approvalId} timed out`, "expired"); }, PERMISSION_TIMEOUT_MS);
+			timer.unref?.(); live.pendingApprovals.set(approvalId, { id: approvalId, summary, options, resolve: resolvePermission, timer });
+			this.publishState(live.info.parentSessionId); this.updateWidget();
+			this.pushMail({ id: this.uuid(), parentSessionId: live.info.parentSessionId, agentName: live.info.canonicalName, kind: "permission", status: "running", approvalId, summary, allowOnceOffered: !!findPermissionOptionId(options, ALLOW_ONCE_IDS), createdAt: this.now(), turnId: live.turnId });
+		});
 	}
-
-	private clearIdleClose(id: string): void {
-		const record = this.idleCloseTimers.get(id);
-		if (!record) return;
-		clearTimeout(record.timer);
-		this.idleCloseTimers.delete(id);
+	respondPermission(parent: string, target: string, approvalId: string, decision: "approve" | "reject"): void { const info = this.get(target, parent); const live = this.live.get(info.id); if (!live || !this.matching(live)) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${info.canonicalName}.`); const pending = requirePendingApproval(live.pendingApprovals, approvalId, info.canonicalName); this.settleApproval(live, pending, () => resolveAgentPermissionDecision(decision, pending.options), `${approvalId} ${decision}`); }
+	private settleApproval<T>(live: RuntimeHandle, approval: PendingApproval, resolveDecision: () => T, note: string, reason?: "expired" | "cancelled"): T { const decision = resolveAndSettlePermission(this.mailbox, { parentSessionId: live.info.parentSessionId, agentName: live.info.canonicalName, approvalId: approval.id }, resolveDecision, (value) => { clearTimeout(approval.timer); live.pendingApprovals.delete(approval.id); approval.resolve(value); }); this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(decision as PermissionResult, reason), summary: approval.summary }); log(live.info, "permission", note); this.publishState(live.info.parentSessionId); this.updateWidget(); return decision; }
+	private rejectApprovals(live: RuntimeHandle, cancelled: boolean, reason: string): void { for (const approval of [...live.pendingApprovals.values()]) this.settleApproval(live, approval, () => cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options), reason, cancelled ? "cancelled" : undefined); live.promptPermissionPending = false; }
+	private isPermissionPending(event: MailEvent): boolean { return event.kind === "permission" && !!event.approvalId && [...this.live.values()].some((live) => live.turnId === event.turnId && live.info.parentSessionId === event.parentSessionId && live.pendingApprovals.has(event.approvalId!)); }
+	private completionEvent(info: AgentInfo): MailEvent { return { id: this.uuid(), parentSessionId: info.parentSessionId, agentName: info.canonicalName, kind: "completion", status: info.status === "paused" ? "interrupted" : info.status, terminalReason: info.terminalReason, turnId: info.currentTurnId, finalResponse: info.finalResponse, error: info.error, createdAt: this.now() }; }
+	private pushMail(event: MailEvent, notifyParent = true): void { if (event.kind === "permission" && !this.isPermissionPending(event)) return; if (event.kind === "completion") this.mailbox.remove((old) => old.kind === "completion" && old.parentSessionId === event.parentSessionId && old.agentName === event.agentName); const index = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName))); if (index >= 0) { this.waiters.splice(index, 1)[0]!.resolve(event); return; } this.mailbox.push(event); if (notifyParent && ![...this.waitAllScopes].some((scope) => scope.parentSessionId === event.parentSessionId && scope.targets.has(event.agentName))) this.notifyParent(event); }
+	private clearCompletionMail(parent: string, name: string): void { this.mailbox.remove((event) => event.kind === "completion" && event.parentSessionId === parent && event.agentName === name); }
+	private notifyParent(event: MailEvent): void { if (event.kind === "permission") { this.pi.sendMessage({ customType: "bstn_subagent_permission", content: `Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`, display: true, details: { ...event } }, { triggerTurn: true, deliverAs: "followUp" }); return; } const info = this.get(event.agentName, event.parentSessionId); const output = boundedResult(event.finalResponse ?? event.error ?? "", info); this.pi.sendMessage({ customType: "bstn_subagent_completion", content: `Subagent ${event.agentName} [${info.backend}] reached ${event.status}.\n\n${output.text}`, display: true, details: { ...event, backend: info.backend, output: output.text, truncated: output.truncated, fullOutputPath: output.fullOutputPath } }, { triggerTurn: true, deliverAs: "followUp" }); }
+	readResponse(parent: string, target: string): { info: AgentInfo; response: string } {
+		const info = this.get(target, parent); const current = this.current(parent, info.id).turn;
+		return { info, response: FINAL.has(info.status) && current?.response ? this.response(current.response) ?? "" : "" };
 	}
-
+	async waitAgent(parent: string, targets: string[] | undefined, signal?: AbortSignal): Promise<MailEvent> { const names = targets?.length ? new Set(targets.map((target) => `/${normalizeTaskName(target)}`)) : undefined; const currentEvent = (event: MailEvent) => {
+			const info = this.readScope(parent).find((value) => value.canonicalName === event.agentName);
+			if (!info || (event.turnId !== undefined && event.turnId !== info.currentTurnId)) return false;
+			return !names || names.has(event.agentName);
+		}; const existing = this.mailbox.claim((event) => event.parentSessionId === parent && currentEvent(event), (event) => this.isPermissionPending(event)); if (existing) return existing; if (names) { const infos = this.readScope(parent).filter((info) => names.has(info.canonicalName)); if (!infos.length) throw new Error(`No matching agents in this parent session: ${[...names].join(", ")}`); const final = infos.find((info) => FINAL.has(info.status)); if (final) return this.completionEvent(final); } if (signal?.aborted) throw signal.reason; return new Promise((resolveWait, rejectWait) => { let waiter!: Waiter; const abort = () => { this.waiters = this.waiters.filter((entry) => entry !== waiter); rejectWait(signal?.reason instanceof Error ? signal.reason : new Error("Wait cancelled.")); }; waiter = { parentSessionId: parent, targets: names, resolve: (event) => { signal?.removeEventListener("abort", abort); resolveWait(event); } }; this.waiters.push(waiter); signal?.addEventListener("abort", abort, { once: true }); }); }
+	async waitAll(parent: string, targets: string[] | undefined, signal?: AbortSignal): Promise<{ infos?: AgentInfo[]; event?: MailEvent }> { const names = targets?.length ? new Set(targets.map((target) => `/${normalizeTaskName(target)}`)) : new Set(this.defaultWaitTargets.get(parent) ?? []); if (targets?.length) { const known = this.readScope(parent); const missing = [...names].filter((name) => !known.some((info) => info.canonicalName === name)); if (missing.length) throw new Error(`Agent not found in this parent session: ${missing.join(", ")}`); } const scope: WaitAllScope = { parentSessionId: parent, targets: names }; this.waitAllScopes.add(scope); try { for (;;) { if (signal?.aborted) throw signal.reason; const permission = this.mailbox.claim((event) => event.kind === "permission" && event.parentSessionId === parent && names.has(event.agentName), (event) => this.isPermissionPending(event)); if (permission) return { event: permission }; const infos = this.readScope(parent).filter((info) => names.has(info.canonicalName)); if (infos.length === names.size && infos.every((info) => FINAL.has(info.status))) { for (const info of infos) this.defaultWaitTargets.get(parent)?.delete(info.canonicalName); this.mailbox.remove((event) => event.kind === "completion" && event.parentSessionId === parent && names.has(event.agentName)); return { infos }; } await delay(100, undefined, signal ? { signal } : undefined); } } finally { this.waitAllScopes.delete(scope); } }
+	private clearIdleClose(id: string): void { const record = this.idleCloseTimers.get(id); if (record) clearTimeout(record.timer); this.idleCloseTimers.delete(id); }
 	private scheduleIdleClose(info: AgentInfo): void {
 		if (!info.completedAt || info.status === "closed") return;
-		this.clearIdleClose(info.id);
-		const completedAt = info.completedAt;
-		const timer = setTimeout(() => void this.autoCloseIdle(info.infoFile, info.id, completedAt), SUBAGENT_IDLE_CLOSE_MS);
-		timer.unref?.();
-		this.idleCloseTimers.set(info.id, { timer, completedAt });
+		this.clearIdleClose(info.id); const completedAt = info.completedAt;
+		const timer = setTimeout(() => void this.autoCloseIdle(info.parentSessionId, info.id, completedAt), SUBAGENT_IDLE_CLOSE_MS);
+		timer.unref?.(); this.idleCloseTimers.set(info.id, { timer, completedAt });
 	}
-
-	private async autoCloseIdle(infoFile: string, id: string, completedAt: number): Promise<void> {
-		return this.enqueueControl(id, () => this.autoCloseIdleNow(infoFile, id, completedAt));
-	}
-
-	private async autoCloseIdleNow(infoFile: string, id: string, completedAt: number): Promise<void> {
-		const record = this.idleCloseTimers.get(id);
-		if (!record || record.completedAt !== completedAt) return;
+	private async autoCloseIdle(parent: string, id: string, completedAt: number): Promise<void> {
+		const record = this.idleCloseTimers.get(id); if (!record || record.completedAt !== completedAt) return;
 		this.idleCloseTimers.delete(id);
-		const info = readJson<AgentInfo>(infoFile);
-		if (!info || info.completedAt !== completedAt || !FINAL.has(info.status) || info.status === "closed") return;
-		// Persist the claim before awaiting resource cleanup so follow-up work cannot race the close.
-		info.status = "closed";
-		info.closedAt = this.now();
-		info.lastActivity = this.now();
-		const active = this.live.get(info.id); if (active) { this.flushThought(active); this.terminalizeActiveTools(active, "closed"); }
-		this.appendLedger(info, { kind: "runtime", state: "closed" });
-		this.appendLedger(info, { kind: "completion", status: "closed", summary: "agent closed" });
-		this.persist(info);
-		log(info, "lifecycle", "auto-closed after 15 minutes idle");
-		await this.closeLive(id, true);
-		await this.closeViewer(info).catch(() => undefined);
-		this.refresh();
+		try { const info = this.current(parent, id).info; if (info.completedAt !== completedAt || !FINAL.has(info.status) || info.status === "closed") return; await this.close(parent, info.canonicalName); } catch {}
 	}
-
-	private async closeLive(id: string, remove: boolean): Promise<void> {
-		this.clearIdleClose(id);
-		const live = this.live.get(id);
-		if (!live) return;
-		live.closing = true;
-		live.generation++;
-		live.pending = false;
-		this.flushThought(live);
-		this.terminalizeActiveTools(live, "closed");
-		this.rejectApprovals(live, false, "agent closed");
-		await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]);
-		if (remove) this.live.delete(id);
-	}
-
-	currentActivity(info: AgentInfo): string | undefined {
-		const live = this.live.get(info.id);
-		if (!live?.pending) return undefined;
-		if (live.promptPermissionPending || live.pendingApprovals.size > 0) return "Awaiting approval";
-		const tool = [...live.activeTools.values()].at(-1);
-		if (tool) return `Tool · ${tool}`;
-		return live.phase || "Working";
-	}
-
-	activitySummary(info: AgentInfo): string {
-		return agentActivitySummary(info, this.currentActivity(info));
-	}
-
-	private mutateActivity(live: RuntimeHandle, mutate: () => void): void {
-		const before = this.currentActivity(live.info);
-		mutate();
-		if (before !== this.currentActivity(live.info)) {
-			this.publishState(live.info.parentSessionId);
-			this.updateWidget();
+	async shutdown(): Promise<void> {
+		if (this.widgetTimer) clearInterval(this.widgetTimer); this.widgetTimer = undefined;
+		this.ctx?.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined);
+		for (const timer of this.idleCloseTimers.values()) clearTimeout(timer.timer); this.idleCloseTimers.clear();
+		const terminalByParent = new Map<string, AgentInfo[]>();
+		for (const parent of this.readyParents) {
+			try {
+				const next = this.mutate(parent, (current) => {
+					let updated = current;
+					for (const turn of Object.values(current.turns)) {
+						if (turn.state === "queued") updated = transitionTurn(updated, turn.id, "terminal", this.now(), { status: "paused", reason: "shutdown-paused" });
+						else if (turn.state === "admitted" || turn.state === "running") updated = transitionTurn(updated, turn.id, "terminal", this.now(), { status: "interrupted", reason: "shutdown-interrupted" });
+					}
+					return updated;
+				});
+				terminalByParent.set(parent, this.project(next));
+			} catch {}
 		}
-	}
-
-	private setPhase(live: RuntimeHandle, phase: string): void {
-		if (live.phase === phase) return;
-		this.flushThought(live);
-		this.mutateActivity(live, () => { live.phase = phase; });
-		this.appendLedger(live.info, { kind: "phase", name: phase });
-	}
-
-	private refresh(): void {
-		this.updateWidget();
-		this.reportParent([...this.live.values()].some((live) => live.pending));
-	}
-
-	private updateWidget(): void {
-		const ctx = this.ctx;
-		if (!ctx || ctx.mode !== "tui") return;
-		let parent: string;
-		try { parent = this.parentSessionId(ctx); } catch { return; }
-		const infos = this.readScope(parent).filter((info) => info.status !== "closed");
-		if (!infos.length) {
-			ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined);
-			return;
-		}
-		const activities = new Map(infos.map((info) => [info.id, this.activitySummary(info)]));
-		ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, (_tui, theme) => ({
-			render(width: number) {
-				const running = infos.filter((info) => info.status === "starting" || info.status === "running").length;
-				const lines = [theme.fg("accent", theme.bold(`Subagents — ${running} running · ${infos.length - running} settled`))];
-				for (const info of infos) {
-					const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
-					lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", formatPersistentWidgetMetadata(info))}`);
-					lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`));
-				}
-				return lines.map((line) => truncateToWidth(line, width));
-			},
-			invalidate() {},
+		const lives = [...this.live.values()]; this.live.clear();
+		await Promise.allSettled(lives.map(async (live) => {
+			const wasPending = live.pending;
+			live.closing = true; live.pending = false;
+			if (wasPending) {
+				this.flushThought(live); this.terminalizeActiveTools(live, "interrupted"); this.rejectApprovals(live, true, "shutdown");
+				this.appendLedger(live.info, { kind: "runtime", state: "interrupted", detail: "shutdown" }); this.appendLedger(live.info, { kind: "completion", status: "interrupted", summary: "shutdown" });
+			} else { live.activeTools.clear(); this.rejectApprovals(live, true, "shutdown"); }
+			try { await Promise.all([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]); } catch {}
 		}));
+		for (const [parent, infos] of terminalByParent) {
+			await Promise.allSettled(infos.map((info) => this.closeViewer(info)));
+			try { this.mutate(parent, (current) => { let updated = current; for (const info of infos) if (current.agents[info.id]?.viewerPaneId || current.agents[info.id]?.viewerTabId) updated = updateAgentRuntimeResources(updated, info.id, { viewerPaneId: null, viewerTabId: null }, this.now()); return updated; }); } catch {}
+		}
+		// Wait cancellation only stops observation. Shutdown is a lifecycle event, so every
+		// local observer receives its current target's effective interrupted completion.
+		for (const waiter of this.waiters.splice(0)) {
+			const infos = terminalByParent.get(waiter.parentSessionId) ?? [];
+			const info = infos.find((entry) => !waiter.targets || waiter.targets.has(entry.canonicalName));
+			if (info) waiter.resolve(this.completionEvent(info));
+		}
+		this.mailbox.remove(() => true); this.defaultWaitTargets.clear(); this.stateListeners.clear(); this.lastSnapshots.clear(); this.ctx = undefined;
+		this.reportParent(false, true);
 	}
 
-	private reportParent(working: boolean, force = false): void {
-		if (this.herdr?.reportParent) {
-			if (!force && working === this.parentWorking) return;
-			this.parentWorking = working;
-			this.parentQueue = this.parentQueue.then(() => this.herdr!.reportParent!(working)).catch(() => undefined);
-			return;
-		}
-		const paneId = process.env.HERDR_PANE_ID;
-		if (!paneId || process.env.HERDR_ENV !== "1") return;
-		if (!force && working === this.parentWorking) return;
-		this.parentWorking = working;
-		const seq = ++this.parentSeq;
-		const args = working
-			? ["pane", "report-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--state", "working", "--message", "Subagent working", "--seq", String(seq)]
-			: ["pane", "release-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--seq", String(seq)];
-		this.parentQueue = this.parentQueue.then(async () => {
-			await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), args, this.ctx?.cwd ?? process.cwd(), 5000);
-		}).catch(() => undefined);
-	}
+	currentActivity(info: AgentInfo): string | undefined { const live = this.live.get(info.id); if (!live?.pending || !this.matching(live)) return undefined; if (live.promptPermissionPending || live.pendingApprovals.size) return "Awaiting approval"; const tool = [...live.activeTools.values()].at(-1); return tool ? `Tool · ${tool}` : live.phase || "Working"; }
+	activitySummary(info: AgentInfo): string { return agentActivitySummary(info, this.currentActivity(info)); }
+	private flushThought(live: RuntimeHandle): void { if (live.thoughtTimer) clearTimeout(live.thoughtTimer); live.thoughtTimer = undefined; if (!live.thoughtChunks) return; this.appendLedger(live.info, { kind: "thought", previewKind: live.thoughtPreviewKind ?? "generic", preview: live.thoughtPreview ?? "Working through details", chunks: live.thoughtChunks, characters: live.thoughtCharacters }); live.thoughtChunks = 0; live.thoughtCharacters = 0; live.thoughtPreview = undefined; live.thoughtPreviewKind = undefined; }
+	private bufferThought(live: RuntimeHandle, raw: unknown): void { const text = typeof raw === "string" ? raw : ""; if (!text.trim()) return; live.thoughtChunks++; live.thoughtCharacters += Array.from(text).length; const value = generatedThoughtPreview(text); if (value) { live.thoughtPreview = value.preview; live.thoughtPreviewKind = value.previewKind; } }
+	private terminalizeActiveTools(live: RuntimeHandle, status: string): void { for (const event of terminalizeActiveToolEvents(live.activeTools, status)) this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status }); live.activeTools.clear(); }
+	private setPhase(live: RuntimeHandle, phase: string): void { if (live.phase === phase) return; live.phase = phase; this.appendLedger(live.info, { kind: "phase", name: phase }); this.publishState(live.info.parentSessionId); this.updateWidget(); }
+	private refresh(): void { this.updateWidget(); const ctx = this.ctx; if (!ctx) return; try { const parent = this.parentSessionId(ctx); const working = Object.values(this.manifest(parent).turns).some((turn) => turn.state === "queued" || turn.state === "admitted" || turn.state === "running"); this.reportParent(working); } catch {} }
+	reassertParent(): void { this.refresh(); }
+	private updateWidget(): void { const ctx = this.ctx; if (!ctx || ctx.mode !== "tui") return; let infos: AgentInfo[]; try { infos = this.readScope(this.parentSessionId(ctx)).filter((info) => info.status !== "closed"); } catch { return; } if (!infos.length) { ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined); return; } const activities = new Map(infos.map((info) => [info.id, this.activitySummary(info)])); ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, (_tui, theme) => ({ render: (width: number) => { const running = infos.filter((info) => ["queued", "starting", "running"].includes(info.status)).length; const lines = [theme.fg("accent", theme.bold(`Subagents — ${running} active · ${infos.length - running} settled`))]; for (const info of infos) { const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning"; lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", formatPersistentWidgetMetadata(info))}`); lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`)); } return lines.map((line) => truncateToWidth(line, width)); }, invalidate() {} })); }
+	private reportParent(working: boolean, force = false): void { if (this.herdr?.reportParent) { if (!force && working === this.parentWorking) return; this.parentWorking = working; this.parentQueue = this.parentQueue.then(() => this.herdr!.reportParent!(working)).catch(() => undefined); return; } const paneId = process.env.HERDR_PANE_ID; if (!paneId || process.env.HERDR_ENV !== "1" || (!force && working === this.parentWorking)) return; this.parentWorking = working; const seq = ++this.parentSeq; const args = working ? ["pane", "report-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--state", "working", "--message", "Subagent working", "--seq", String(seq)] : ["pane", "release-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--seq", String(seq)]; this.parentQueue = this.parentQueue.then(async () => { await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), args, this.ctx?.cwd ?? process.cwd(), 5000); }).catch(() => undefined); }
 }
+
 
 class AgentLogOverlay {
 	private readonly tui: TUI;
@@ -2029,8 +1387,8 @@ function eventText(event: MailEvent, manager: UnifiedManager, parentSessionId: s
 	const info = manager.get(event.agentName, parentSessionId);
 	const output = boundedResult(event.finalResponse ?? event.error ?? "", info);
 	return {
-		text: JSON.stringify({ agent_name: event.agentName, status: event.status, finalResponse: output.text, error: event.error }, null, 2),
-		details: { ...event, truncated: output.truncated, fullOutputPath: output.fullOutputPath },
+		text: JSON.stringify({ agent_name: event.agentName, status: event.status, terminal_reason: event.terminalReason, turn_id: event.turnId, finalResponse: output.text, error: event.error }, null, 2),
+		details: { ...event, turn_id: event.turnId, terminal_reason: event.terminalReason, truncated: output.truncated, fullOutputPath: output.fullOutputPath },
 	};
 }
 
@@ -2057,9 +1415,9 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		get description() {
-			return `Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Returns after startup; use wait_agent or wait_all_agents for results. For Pi, pi_model must be provider/model-id and pi_thinking selects reasoning effort; each independently uses explicit spawn > template > parent precedence. Pi-only fields are rejected for Cursor. Templates can configure backend-specific model, tools, skills, extensions, and prompts.\n\nAvailable templates:\n${templatesDescription()}`;
+			return `Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Durably queues work and returns before runtime startup; use wait_agent or wait_all_agents for results. Queued work remains visible in Herdr; reload-paused work requires an explicit new message. For Pi, pi_model must be provider/model-id and pi_thinking selects reasoning effort; each independently uses explicit spawn > template > parent precedence. Pi-only fields are rejected for Cursor. Templates can configure backend-specific model, tools, skills, extensions, and prompts.\n\nAvailable templates:\n${templatesDescription()}`;
 		},
-		promptSnippet: "Spawn a session-scoped Pi or Cursor ACP agent; backend must be explicit.",
+		promptSnippet: "Queue a session-scoped Pi or Cursor ACP agent; backend must be explicit.",
 		promptGuidelines: [
 			"Always pass backend=pi or backend=cursor explicitly to spawn_agent; never infer a hidden default.",
 			"Before spawn_agent selects a non-inherited model, use list_subagent_models to discover exact backend-specific spawn values and thinking controls.",
@@ -2077,6 +1435,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				agent_name: info.canonicalName,
 				backend: info.backend,
 				status: info.status,
+				turn_id: info.currentTurnId,
+				turn_sequence: info.turnSequence,
 				model: info.model,
 				viewerPaneId: info.viewerPaneId,
 				viewerTabId: info.viewerTabId,
@@ -2118,7 +1478,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 	pi.registerTool({
 		name: "wait_agent",
 		label: "Wait Agent",
-		description: "Wait without a timeout for one session-owned agent completion or Cursor permission request. Omit targets to receive the next event.",
+		description: "Wait without a timeout for one session-owned agent completion or Cursor permission request. Queued work stays pending; reload-paused work resolves as interrupted with terminal_reason. Omit targets to receive the next event.",
 		promptSnippet: "Wait for one selected subagent completion or permission request.",
 		parameters: Type.Object({ targets: Type.Optional(Type.Array(Type.String())) }),
 		async execute(_id, params, signal, _update, ctx) {
@@ -2146,7 +1506,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			}
 			const responses = (waited.infos ?? []).map((info) => {
 				const output = boundedResult(info.finalResponse ?? info.error ?? "", info);
-				return { agent_name: info.canonicalName, backend: info.backend, status: info.status, finalResponse: output.text, error: info.error };
+				return { agent_name: info.canonicalName, backend: info.backend, status: info.status === "paused" ? "interrupted" : info.status, terminal_reason: info.terminalReason, finalResponse: output.text, error: info.error };
 			});
 			return textResult(JSON.stringify({ responses }, null, 2), { responses });
 		},
@@ -2175,6 +1535,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				activity_summary: manager.activitySummary(info),
 				elapsed: formatElapsed(info.createdAt),
 				last_task_message: info.lastTaskMessage ?? null,
+				turn_id: info.currentTurnId ?? null,
+				terminal_reason: info.terminalReason ?? null,
 				...(params.include_all ? { parent_session_id: info.parentSessionId } : {}),
 			}));
 			return textResult(JSON.stringify({ agents }, null, 2), { agents });
@@ -2200,11 +1562,11 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 	pi.registerTool({
 		name: "send_message",
 		label: "Send Message",
-		description: "Send a message to a session-owned agent. Pi receives true steering while active; Cursor ACP cancels and restarts with the correction. Settled agents start another turn.",
+		description: "Send a message to a session-owned agent. Pi receives true steering while active; Cursor ACP replaces an active turn with a directly admitted correction. Settled or reload-paused agents queue a new turn; queued/admitted turns reject sends.",
 		parameters: Type.Object({ target: Type.String(), message: Type.String() }),
 		async execute(_id, params, _signal, _update, ctx) {
 			const result = await manager.send(manager.parentSessionId(ctx), params.target, params.message);
-			return textResult(result.delivery === "steer" ? "Message steered into running Pi agent." : result.delivery === "cancel-and-prompt" ? "Running Cursor turn cancelled; corrective prompt queued on the same ACP session." : "Message started a new agent turn.", { target: params.target, ...result });
+			return textResult(result.delivery === "steer" ? "Message steered into running Pi agent." : result.delivery === "cancel-and-prompt" ? "Running Cursor turn cancelled; corrective turn admitted on the same ACP session." : "Message queued as a new agent turn.", { target: params.target, ...result, turn_id: result.turnId });
 		},
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("send_message ")) + theme.fg("accent", args.target), 0, 0); },
 		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ send failed" : `✓ ${result.details?.delivery}`), 0, 0); },
@@ -2216,8 +1578,9 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		description: "Abort an active turn without permanently closing the session.",
 		parameters: TargetSchema,
 		async execute(_id, params, _signal, _update, ctx) {
-			const previous = await manager.interrupt(manager.parentSessionId(ctx), params.target);
-			return textResult("Interrupt handled.", { target: params.target, previous_status: previous });
+			const parent = manager.parentSessionId(ctx); const previous = await manager.interrupt(parent, params.target);
+			const info = manager.get(params.target, parent);
+			return textResult("Interrupt handled.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId });
 		},
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("interrupt_agent ")) + theme.fg("accent", args.target), 0, 0); },
 		renderResult(result: any, _options, theme) { return new Text(theme.fg("warning", `↯ previous: ${result.details?.previous_status}`), 0, 0); },
@@ -2229,8 +1592,9 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		description: "Permanently close a session-owned agent process and its Herdr viewer. History remains readable.",
 		parameters: TargetSchema,
 		async execute(_id, params, _signal, _update, ctx) {
-			const previous = await manager.close(manager.parentSessionId(ctx), params.target);
-			return textResult("Agent closed.", { target: params.target, previous_status: previous });
+			const parent = manager.parentSessionId(ctx); const previous = await manager.close(parent, params.target);
+			const info = manager.get(params.target, parent);
+			return textResult("Agent closed.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId });
 		},
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("close_agent ")) + theme.fg("accent", args.target), 0, 0); },
 		renderResult(result: any, _options, theme) { return new Text(theme.fg("success", `✓ previous: ${result.details?.previous_status}`), 0, 0); },

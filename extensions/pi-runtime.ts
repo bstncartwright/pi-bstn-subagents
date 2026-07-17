@@ -92,7 +92,8 @@ interface PendingRequest {
 
 export class PiRpcClient {
 	private readonly info: PiRuntimeAgent;
-	private readonly onEvent: (event: any) => void;
+	private readonly onEvent: (event: any, turnToken?: string) => void;
+	private activeTurnToken?: string;
 	private readonly onExit: (error?: Error) => void;
 	private readonly log: (category: string, message: string) => void;
 	private proc?: ChildProcessWithoutNullStreams;
@@ -102,7 +103,7 @@ export class PiRpcClient {
 	private candidateResponse = "";
 	private candidateError?: string;
 
-	constructor(info: PiRuntimeAgent, onEvent: (event: any) => void, onExit: (error?: Error) => void, log: (category: string, message: string) => void) {
+	constructor(info: PiRuntimeAgent, onEvent: (event: any, turnToken?: string) => void, onExit: (error?: Error) => void, log: (category: string, message: string) => void) {
 		this.info = info;
 		this.onEvent = onEvent;
 		this.onExit = onExit;
@@ -139,7 +140,8 @@ export class PiRpcClient {
 		await this.command({ type: "get_state" });
 	}
 
-	async prompt(message: string): Promise<void> {
+	async prompt(message: string, turnToken?: string): Promise<void> {
+		this.activeTurnToken = turnToken;
 		this.candidateResponse = "";
 		this.candidateError = undefined;
 		await this.command({ type: "prompt", message });
@@ -203,13 +205,13 @@ export class PiRpcClient {
 		}
 		if (event.type === "message_update") {
 			const delta = event.assistantMessageEvent;
-			if (delta?.type === "text_delta") this.onEvent({ type: "text", text: delta.delta ?? "" });
-			if (delta?.type === "thinking_delta") this.onEvent({ type: "thought", text: delta.delta ?? "" });
+			if (delta?.type === "text_delta") this.emit({ type: "text", text: delta.delta ?? "" });
+			if (delta?.type === "thinking_delta") this.emit({ type: "thought", text: delta.delta ?? "" });
 		}
 		const toolEvent = normalizePiRpcToolEvent(event);
-		if (toolEvent) this.onEvent(toolEvent);
-		if (event.type === "auto_retry_start") this.onEvent({ type: "phase", phase: "Retrying" });
-		if (event.type === "auto_compaction_start" || event.type === "compaction_start") this.onEvent({ type: "phase", phase: "Compacting" });
+		if (toolEvent) this.emit(toolEvent);
+		if (event.type === "auto_retry_start") this.emit({ type: "phase", phase: "Retrying" });
+		if (event.type === "auto_compaction_start" || event.type === "compaction_start") this.emit({ type: "phase", phase: "Compacting" });
 		if (event.type === "message_end" && event.message?.role === "assistant") {
 			this.candidateResponse = messageText(event.message);
 			this.candidateError = ["error", "aborted"].includes(event.message.stopReason)
@@ -226,8 +228,10 @@ export class PiRpcClient {
 			}
 		}
 		if (event.type === "auto_retry_end" && event.success === false) this.candidateError = event.finalError || "Pi retry failed.";
-		if (event.type === "agent_settled") this.onEvent({ type: "settled", output: this.candidateResponse, error: this.candidateError });
+		if (event.type === "agent_settled") { this.emit({ type: "settled", output: this.candidateResponse, error: this.candidateError }); this.activeTurnToken = undefined; }
 	}
+
+	private emit(event: any): void { this.onEvent(event, this.activeTurnToken); }
 
 	private finish(error?: Error): void {
 		if (this.closed && !error) return;
