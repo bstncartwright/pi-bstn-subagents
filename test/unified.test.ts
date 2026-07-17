@@ -6,6 +6,12 @@ import {
 	formatElapsed,
 	formatPersistentWidgetMetadata,
 	JsonlDecoder,
+	normalizeCursorToolUpdate,
+	normalizePiRpcToolEvent,
+	permissionJournalStatus,
+	opaqueToolValueCount,
+	terminalizeActiveToolEvents,
+	finalizeActiveToolStatus,
 	normalizeTaskName,
 	parentScopeKey,
 	parseAgentTemplateText,
@@ -19,6 +25,7 @@ import {
 	SUBAGENT_IDLE_CLOSE_MS,
 	taskStorageKey,
 } from "../extensions/unified.ts";
+import { resolveAutomaticPermission } from "../extensions/helpers.ts";
 
 test("unified JSONL framing preserves Unicode line separators", () => {
 	const decoder = new JsonlDecoder();
@@ -303,6 +310,25 @@ test("settled subagents auto-close after fifteen idle minutes", async () => {
 	assert.match(source, /auto-closed after 15 minutes idle/);
 });
 
+test("response deltas stay out of the journal until one finalized response", async () => {
+	const { readFile } = await import("node:fs/promises");
+	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
+	const piHandler = source.slice(source.indexOf("private handlePiEvent"), source.indexOf("private handleCursorNotification"));
+	const cursorHandler = source.slice(source.indexOf("private handleCursorNotification"), source.indexOf("private async handleCursorRequest"));
+	const finalize = source.slice(source.indexOf("private finalize"), source.indexOf("private completionEvent"));
+	assert.doesNotMatch(piHandler, /kind: "response"/);
+	assert.doesNotMatch(cursorHandler, /kind: "response"/);
+	assert.match(piHandler, /live\.currentOutput \+= event\.text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", event\.text\)/);
+	assert.match(cursorHandler, /live\.currentOutput \+= text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", text\)/);
+	assert.match(source, /this\.candidateResponse = messageText\(event\.message\);/);
+	assert.match(source, /this\.candidateResponse = messageText\(assistant\);/);
+	assert.doesNotMatch(source, /this\.candidateResponse = messageText\([^)]*\)\.trim\(\);/);
+	const responseAppend = 'this.appendLedger(live.info, { kind: "response", text: live.info.finalResponse });';
+	assert.equal(finalize.split(responseAppend).length - 1, 1);
+	assert.ok(finalize.indexOf(responseAppend) < finalize.indexOf('this.appendLedger(live.info, { kind: "runtime", state: status })'));
+	assert.ok(finalize.indexOf(responseAppend) < finalize.indexOf('this.appendLedger(live.info, { kind: "completion", status, summary: error ?? live.info.finalResponse })'));
+});
+
 test("activity summaries prefer sanitized live phases and fall back to the task", () => {
 	assert.equal(compactActivityText("\u001b[31mRead\u001b[0m\n  package.json\u202e"), "Read package.json");
 	assert.equal(
@@ -351,4 +377,55 @@ test("persistent widget metadata omits stale thinking for Cursor exactly", () =>
 		status: "failed",
 		createdAt: 1_000,
 	}, 66_000), "[cursor] Grok 4.5 High · failed · 1:05");
+});
+
+
+test("Pi RPC tool normalization retains stable ids, args, partial results, result, and isError", () => {
+	assert.deepEqual(normalizePiRpcToolEvent({ type: "tool_execution_start", toolCallId: "pi-1", toolName: "bash", args: { command: "echo hi" } }), {
+		type: "tool_start", id: "pi-1", name: "bash", input: { command: "echo hi" },
+	});
+	assert.deepEqual(normalizePiRpcToolEvent({ type: "tool_execution_update", toolCallId: "pi-1", partialResult: { text: "half" } }), {
+		type: "tool_update", id: "pi-1", status: undefined, partialResult: { text: "half" },
+	});
+	assert.deepEqual(normalizePiRpcToolEvent({ type: "tool_execution_end", toolCallId: "pi-1", result: { text: "bad" }, isError: true }), {
+		type: "tool_end", id: "pi-1", status: undefined, result: { text: "bad" }, isError: true,
+	});
+	assert.deepEqual(normalizePiRpcToolEvent({ type: "tool_execution_start", toolName: "bash" }), { type: "tool_observed", phase: "Observed Pi tool without stable id" });
+});
+
+test("Cursor tool normalization never correlates title-only updates and uses explicit stable IDs", () => {
+	assert.deepEqual(normalizeCursorToolUpdate({ sessionUpdate: "tool_call", title: "bash", toolCallId: "cursor-1", input: { command: "echo hi" } }), {
+		type: "tool_start", id: "cursor-1", name: "bash", input: { command: "echo hi" },
+	});
+	assert.deepEqual(normalizeCursorToolUpdate({ sessionUpdate: "tool_call_update", title: "bash", toolCallId: "cursor-1", status: "completed", output: "done" }), {
+		type: "tool_end", id: "cursor-1", status: "completed", result: "done", isError: false,
+	});
+	const observed = normalizeCursorToolUpdate({ sessionUpdate: "tool_call_update", title: "same title", status: "completed", output: "unavailable" });
+	assert.equal(observed?.type, "tool_observed");
+	assert.match(observed?.type === "tool_observed" ? observed.phase : "", /same title/);
+});
+
+
+test("terminal tool helper emits one exact end per active ID and clears no lifecycle by title", () => {
+	const events = terminalizeActiveToolEvents(new Map([["one", "bash"], ["two", "same title"]]), "interrupted");
+	assert.deepEqual(events, [{ id: "one", status: "interrupted" }, { id: "two", status: "interrupted" }]);
+	assert.equal(finalizeActiveToolStatus("completed"), "settled-without-terminal-update");
+	assert.equal(finalizeActiveToolStatus("failed"), "failed");
+});
+
+test("permission journal state follows actual ACP outcomes including fallback cancellation", () => {
+	assert.equal(permissionJournalStatus({ outcome: { outcome: "selected", optionId: "allow-once" } }), "resolved");
+	assert.equal(permissionJournalStatus({ outcome: { outcome: "selected", optionId: "reject_once" } }), "rejected");
+	assert.equal(permissionJournalStatus(resolveAutomaticPermission("allow-once", [{ optionId: "reject-once" }])), "rejected");
+	assert.equal(permissionJournalStatus(resolveAutomaticPermission("deny", [{ optionId: "reject-once" }])), "rejected");
+	assert.equal(permissionJournalStatus(resolveAutomaticPermission("deny", [])), "cancelled");
+	assert.equal(permissionJournalStatus({ outcome: { outcome: "cancelled" } }, "expired"), "expired");
+});
+
+
+test("repeated opaque partial results become counts without persisting their text", () => {
+	const partials = ["token=top-secret", "https://user:password@example.test"];
+	const records = partials.map((partial, index) => ({ kind: "tool-update", id: "same", status: "streaming", count: opaqueToolValueCount(partial), index }));
+	assert.deepEqual(records.map((record) => record.count), [16, 34]);
+	assert.doesNotMatch(JSON.stringify(records), /token|secret|password|example/i);
 });

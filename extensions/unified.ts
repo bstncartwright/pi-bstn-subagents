@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -45,6 +46,11 @@ import {
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
 import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent, type PermissionMailKey } from "./mailbox.ts";
 import {
+	normalizeRunLedgerEvent,
+	generatedThoughtPreview,
+	type RunLedgerEvent,
+} from "./run-ledger.ts";
+import {
 	ALLOW_ONCE_IDS,
 	cancelledPermissionResult,
 	findPermissionOptionId,
@@ -52,8 +58,11 @@ import {
 	normalizePermissionOptions,
 	redactPermissionPayload,
 	rejectPermissionResult,
+	permissionSelectLabels,
 	resolveAgentPermissionDecision,
 	resolveAutomaticPermission,
+	resolvePromptPermissionSelection,
+	type PermissionResult,
 	restoreCursorConfigVerified,
 	skippedAskQuestion,
 	type PermissionMode,
@@ -139,6 +148,39 @@ export interface AgentInfo {
 	error?: string;
 }
 
+/** The private viewer journal is deterministically derived, never persisted in AgentInfo. */
+export function runLedgerJournalPath(info: Pick<AgentInfo, "logFile">): string {
+	return info.logFile.endsWith(".events.log") ? `${info.logFile.slice(0, -".events.log".length)}.viewer.jsonl` : `${info.logFile}.viewer.jsonl`;
+}
+
+/** POSIX single-quote escaping for Herdr's shell command string. */
+export function quotePosixShell(value: string): string {
+	return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+export const shellQuote = quotePosixShell;
+
+export interface RunLedgerViewerCommandOptions {
+	nodeExecutable?: string;
+	viewerPath: string;
+	infoPath: string;
+	journalPath: string;
+	rawLogPath: string;
+}
+
+/** Build the only shell string handed to Herdr; every executable and path is quoted. */
+export function buildRunLedgerViewerCommand(options: RunLedgerViewerCommandOptions): string {
+	const node = options.nodeExecutable ?? process.execPath;
+	return [
+		quotePosixShell(node), "--experimental-strip-types", "--no-warnings", quotePosixShell(options.viewerPath),
+		"--info", quotePosixShell(options.infoPath), "--journal", quotePosixShell(options.journalPath), "--raw", quotePosixShell(options.rawLogPath),
+	].join(" ");
+}
+
+export const buildViewerCommand = buildRunLedgerViewerCommand;
+
+const RUN_LEDGER_VIEWER_PATH = fileURLToPath(new URL("./run-ledger-viewer.ts", import.meta.url));
+
 export function formatElapsed(startedAt: number, now = Date.now()): string {
 	const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
 	const minutes = Math.floor(seconds / 60);
@@ -215,6 +257,12 @@ interface RuntimeHandle {
 	queuedCursorMessage?: string;
 	phase: string;
 	activeTools: Map<string, string>;
+	/** Raw thought chunks exist only in this short-lived memory buffer. */
+	thoughtChunks: number;
+	thoughtCharacters: number;
+	thoughtPreview?: string;
+	thoughtPreviewKind?: "heading" | "generic";
+	thoughtTimer?: ReturnType<typeof setTimeout>;
 	promptPermissionPending: boolean;
 	pendingApprovals: Map<string, PendingApproval>;
 }
@@ -638,6 +686,74 @@ function runCommand(command: string, args: string[], cwd: string, timeoutMs = 50
 	});
 }
 
+export type NormalizedBackendToolEvent =
+	| { type: "tool_start"; id: string; name: string; input?: unknown }
+	| { type: "tool_update"; id: string; status?: string; partialResult?: unknown }
+	| { type: "tool_end"; id: string; status?: string; result?: unknown; isError?: boolean }
+	| { type: "tool_observed"; phase: string };
+
+function stableString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value : undefined;
+}
+function own(object: Record<string, unknown> | undefined, key: string): unknown {
+	return object && Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+}
+
+/** Preserve Pi RPC lifecycle fields verbatim until the journal boundary summarizes them. */
+export function normalizePiRpcToolEvent(event: unknown): NormalizedBackendToolEvent | undefined {
+	const raw = event && typeof event === "object" ? event as Record<string, unknown> : undefined;
+	if (!raw) return undefined;
+	const type = raw.type;
+	if (type !== "tool_execution_start" && type !== "tool_execution_update" && type !== "tool_execution_end") return undefined;
+	const id = stableString(raw.toolCallId);
+	if (!id) return { type: "tool_observed", phase: "Observed Pi tool without stable id" };
+	const name = stableString(raw.toolName) ?? "tool";
+	if (type === "tool_execution_start") return { type: "tool_start", id, name, input: own(raw, "args") ?? own(raw, "arguments") ?? own(raw, "input") };
+	if (type === "tool_execution_update") return { type: "tool_update", id, status: stableString(raw.status), partialResult: own(raw, "partialResult") };
+	return { type: "tool_end", id, status: stableString(raw.status), result: own(raw, "result"), isError: raw.isError === true };
+}
+
+/** Cursor ACP fields are only accepted from explicit ID/input/output members, never titles. */
+export function normalizeCursorToolUpdate(updateValue: unknown): NormalizedBackendToolEvent | undefined {
+	const update = updateValue && typeof updateValue === "object" ? updateValue as Record<string, unknown> : undefined;
+	if (!update) return undefined;
+	const call = update.toolCall && typeof update.toolCall === "object" ? update.toolCall as Record<string, unknown> : undefined;
+	const id = stableString(own(update, "toolCallId")) ?? stableString(own(call, "toolCallId")) ?? stableString(own(call, "id"));
+	const title = stableString(own(update, "title")) ?? stableString(own(call, "title")) ?? stableString(own(call, "name")) ?? "tool";
+	const status = stableString(own(update, "status")) ?? stableString(own(call, "status"));
+	const terminal = !!status && /^(completed|failed|cancelled|canceled|error)$/i.test(status);
+	if (!id) return { type: "tool_observed", phase: `Observed Cursor tool${title === "tool" ? "" : ` · ${title}`}` };
+	const sessionUpdate = own(update, "sessionUpdate");
+	if (sessionUpdate === "tool_call") return { type: "tool_start", id, name: title, input: own(update, "input") ?? own(update, "arguments") ?? own(call, "input") ?? own(call, "arguments") };
+	if (terminal) return { type: "tool_end", id, status, result: own(update, "result") ?? own(update, "output") ?? own(call, "result") ?? own(call, "output"), isError: own(update, "isError") === true || own(call, "isError") === true };
+	return { type: "tool_update", id, status, partialResult: own(update, "partialResult") ?? own(call, "partialResult") };
+}
+
+export interface TerminalToolEnd { id: string; status: string; }
+/** Never invent a successful tool terminal state when the backend never sent one. */
+export function finalizeActiveToolStatus(runStatus: "completed" | "failed"): string {
+	return runStatus === "failed" ? "failed" : "settled-without-terminal-update";
+}
+/** Produce exact terminal events before an active-tool map is cleared. */
+export function terminalizeActiveToolEvents(activeTools: ReadonlyMap<string, string>, status: string): TerminalToolEnd[] {
+	return [...activeTools.keys()].map((id) => ({ id, status }));
+}
+
+export function opaqueToolValueCount(value: unknown): number | undefined {
+	if (typeof value === "string") return Math.min(value.length, 100_000);
+	if (Array.isArray(value)) return Math.min(value.length, 100_000);
+	if (value == null) return 0;
+	return undefined;
+}
+
+/** Journal permission state follows the actual ACP response, not the requested mode or log wording. */
+export function permissionJournalStatus(result: PermissionResult, reason?: "expired" | "cancelled"): string {
+	if (result.outcome.outcome === "cancelled") return reason ?? "cancelled";
+	const id = result.outcome.optionId.toLowerCase();
+	if (id === "reject-once" || id === "reject_once" || id.startsWith("reject") || id.startsWith("deny")) return "rejected";
+	return "resolved";
+}
+
 function piInvocation(): { command: string; prefix: string[] } {
 	if (process.env.PI_SUBAGENT_PI_BIN) return { command: resolveExecutable("pi", process.env.PI_SUBAGENT_PI_BIN), prefix: [] };
 	const entry = process.argv[1];
@@ -759,12 +875,12 @@ class PiRpcClient {
 			if (delta?.type === "text_delta") this.onEvent({ type: "text", text: delta.delta ?? "" });
 			if (delta?.type === "thinking_delta") this.onEvent({ type: "thought", text: delta.delta ?? "" });
 		}
-		if (event.type === "tool_execution_start") this.onEvent({ type: "tool_start", id: event.toolCallId ?? event.toolName ?? "tool", name: event.toolName ?? "tool" });
-		if (event.type === "tool_execution_end") this.onEvent({ type: "tool_end", id: event.toolCallId ?? event.toolName ?? "tool" });
+		const toolEvent = normalizePiRpcToolEvent(event);
+		if (toolEvent) this.onEvent(toolEvent);
 		if (event.type === "auto_retry_start") this.onEvent({ type: "phase", phase: "Retrying" });
 		if (event.type === "auto_compaction_start" || event.type === "compaction_start") this.onEvent({ type: "phase", phase: "Compacting" });
 		if (event.type === "message_end" && event.message?.role === "assistant") {
-			this.candidateResponse = messageText(event.message).trim();
+			this.candidateResponse = messageText(event.message);
 			this.candidateError = ["error", "aborted"].includes(event.message.stopReason)
 				? event.message.errorMessage || `Pi subagent ended with ${event.message.stopReason}.`
 				: undefined;
@@ -772,7 +888,7 @@ class PiRpcClient {
 		if (event.type === "agent_end") {
 			const assistant = [...(event.messages ?? [])].reverse().find((message: any) => message?.role === "assistant");
 			if (assistant) {
-				this.candidateResponse = messageText(assistant).trim();
+				this.candidateResponse = messageText(assistant);
 				this.candidateError = ["error", "aborted"].includes(assistant.stopReason)
 					? assistant.errorMessage || `Pi subagent ended with ${assistant.stopReason}.`
 					: undefined;
@@ -804,6 +920,7 @@ class UnifiedManager {
 	private readonly defaultWaitTargets = new Map<string, Set<string>>();
 	private ctx?: ExtensionContext;
 	private parentSeq = Date.now() * 1000;
+	private ledgerSeq = Date.now() * 1000;
 	private parentWorking = false;
 	private parentQueue = Promise.resolve();
 	private cursorConfigQueue = Promise.resolve();
@@ -814,6 +931,64 @@ class UnifiedManager {
 		ensureDir(ROOT);
 		ensureDir(AGENTS_DIR);
 		ensureDir(runsDir());
+	}
+
+	/** Initialize a private journal before a Herdr pane can observe it. */
+	private initializeLedger(info: AgentInfo): void {
+		const path = runLedgerJournalPath(info);
+		ensureDir(resolve(path, ".."));
+		const created = !existsSync(path);
+		if (created) writePrivate(path, "");
+		else { try { chmodSync(path, 0o600); } catch {} }
+		if (!created) return;
+		this.appendLedger(info, {
+			kind: "run", runId: info.id, createdAt: info.createdAt, title: info.canonicalName, agentName: info.canonicalName,
+			backend: info.backend, model: info.model, thinking: info.thinking, cwd: info.cwd,
+		});
+		this.appendLedger(info, { kind: "runtime", state: info.status, detail: "journal initialized" });
+	}
+
+	private appendLedger(info: AgentInfo, fields: { kind: RunLedgerEvent["kind"]; turn?: number } & Record<string, unknown>): void {
+		const now = Date.now();
+		const seq = this.ledgerSeq = Math.max(this.ledgerSeq + 1, now * 1000);
+		const candidate = { v: 1, seq, ts: now, turn: info.turn, ...fields };
+		const event = normalizeRunLedgerEvent(candidate);
+		if (!event) return;
+		try { appendFileSync(runLedgerJournalPath(info), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }); } catch { /* journal must never break raw runtime logging */ }
+	}
+
+	private flushThought(live: RuntimeHandle): void {
+		if (live.thoughtTimer) clearTimeout(live.thoughtTimer);
+		live.thoughtTimer = undefined;
+		if (!live.thoughtChunks) return;
+		this.appendLedger(live.info, {
+			kind: "thought", previewKind: live.thoughtPreviewKind ?? "generic", preview: live.thoughtPreview ?? "Working through details",
+			chunks: live.thoughtChunks, characters: live.thoughtCharacters,
+		});
+		live.thoughtChunks = 0; live.thoughtCharacters = 0; live.thoughtPreview = undefined; live.thoughtPreviewKind = undefined;
+	}
+
+	private terminalizeActiveTools(live: RuntimeHandle, status: string): void {
+		for (const event of terminalizeActiveToolEvents(live.activeTools, status)) {
+			this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status });
+		}
+		live.activeTools.clear();
+	}
+
+	private bufferThought(live: RuntimeHandle, raw: unknown): void {
+		const text = typeof raw === "string" ? raw : "";
+		if (!text.trim()) return;
+		live.thoughtChunks++;
+		live.thoughtCharacters += Array.from(text).length;
+		const generated = generatedThoughtPreview(text);
+		if (!generated) return;
+		if (!live.thoughtPreview || (live.thoughtPreviewKind === "generic" && generated.previewKind === "heading")) {
+			live.thoughtPreview = generated.preview;
+			live.thoughtPreviewKind = generated.previewKind;
+		}
+		if (live.thoughtTimer) clearTimeout(live.thoughtTimer);
+		live.thoughtTimer = setTimeout(() => this.flushThought(live), 200);
+		live.thoughtTimer.unref?.();
 	}
 
 	attach(ctx: ExtensionContext): void {
@@ -935,6 +1110,7 @@ class UnifiedManager {
 			};
 			writePrivate(info.logFile, `${params.backend.toUpperCase()} subagent ${info.canonicalName}\nCwd: ${cwd}\nModel: ${info.model}\n\n`);
 			saveInfo(info);
+			this.initializeLedger(info);
 			try {
 				const viewer = await this.createViewer(info);
 				info.viewerPaneId = viewer.paneId;
@@ -952,6 +1128,9 @@ class UnifiedManager {
 				info.error = error instanceof Error ? error.message : String(error);
 				info.completedAt = Date.now();
 				info.lastActivity = Date.now();
+				this.appendLedger(info, { kind: "error", message: info.error });
+				this.appendLedger(info, { kind: "runtime", state: "failed" });
+				this.appendLedger(info, { kind: "completion", status: "failed", summary: info.error });
 				saveInfo(info);
 				await this.closeLive(info.id, false).catch(() => undefined);
 				await this.closeViewer(info).catch(() => undefined);
@@ -988,7 +1167,7 @@ class UnifiedManager {
 			}
 			if (live.queuedCursorMessage) throw new Error(`Cursor agent ${info.canonicalName} already has a corrective message queued.`);
 			live.queuedCursorMessage = message;
-			live.activeTools.clear();
+			this.terminalizeActiveTools(live, "interrupted");
 			this.setPhase(live, "Applying parent correction");
 			this.rejectApprovals(live, true, "active Cursor turn interrupted");
 			live.cursor!.cancel();
@@ -1010,7 +1189,8 @@ class UnifiedManager {
 		if (live) {
 			live.generation++;
 			live.pending = false;
-			live.activeTools.clear();
+			this.flushThought(live);
+			this.terminalizeActiveTools(live, "interrupted");
 			live.promptPermissionPending = false;
 			this.rejectApprovals(live, true, "agent interrupted");
 			try {
@@ -1023,6 +1203,9 @@ class UnifiedManager {
 		info.status = "interrupted";
 		info.completedAt = Date.now();
 		info.lastActivity = Date.now();
+		if (live) this.flushThought(live);
+		this.appendLedger(info, { kind: "runtime", state: "interrupted" });
+		this.appendLedger(info, { kind: "completion", status: "interrupted", summary: "agent interrupted" });
 		saveInfo(info);
 		this.pushMail(this.completionEvent(info), false);
 		this.scheduleIdleClose(info);
@@ -1037,6 +1220,9 @@ class UnifiedManager {
 		info.status = "closed";
 		info.closedAt = Date.now();
 		info.lastActivity = Date.now();
+		const active = this.live.get(info.id); if (active) { this.flushThought(active); this.terminalizeActiveTools(active, "closed"); }
+		this.appendLedger(info, { kind: "runtime", state: "closed" });
+		this.appendLedger(info, { kind: "completion", status: "closed", summary: "agent closed" });
 		saveInfo(info);
 		await this.closeLive(info.id, true);
 		await this.closeViewer(info).catch(() => undefined);
@@ -1140,12 +1326,16 @@ class UnifiedManager {
 		this.idleCloseTimers.clear();
 		const lives = [...this.live.values()];
 		for (const live of lives) {
+			this.flushThought(live);
 			if (live.info.status === "starting" || live.info.status === "running") {
 				live.info.status = "interrupted";
 				live.info.completedAt = Date.now();
 				live.info.lastActivity = Date.now();
+				this.terminalizeActiveTools(live, "interrupted");
+				this.appendLedger(live.info, { kind: "runtime", state: "interrupted", detail: "shutdown" });
+				this.appendLedger(live.info, { kind: "completion", status: "interrupted", summary: "shutdown" });
 				saveInfo(live.info);
-			}
+			} else this.terminalizeActiveTools(live, "closed");
 		}
 		await Promise.allSettled(lives.map((live) => this.closeLive(live.info.id, true)));
 		const viewerInfos = new Map([...ownedInfos, ...lives.map((live) => live.info)].map((info) => [info.id, info]));
@@ -1176,6 +1366,7 @@ class UnifiedManager {
 	}
 
 	private async createViewer(info: AgentInfo): Promise<{ paneId: string; tabId: string }> {
+		this.initializeLedger(info);
 		const result = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), [
 			"tab", "create",
 			"--workspace", process.env.HERDR_WORKSPACE_ID!,
@@ -1189,8 +1380,15 @@ class UnifiedManager {
 		const paneId = parsed.result?.root_pane?.pane_id;
 		const tabId = parsed.result?.tab?.tab_id ?? parsed.result?.root_pane?.tab_id;
 		if (!paneId || !tabId) throw new Error("Herdr did not return viewer pane/tab ids.");
-		const tail = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "run", paneId, `tail -n 200 -F '${info.logFile.replace(/'/g, `'\\''`)}'`], info.cwd, 5000);
-		if (tail.code !== 0) throw new Error((tail.stderr || "Could not start Herdr viewer").trim());
+		const viewerCommand = buildRunLedgerViewerCommand({
+			nodeExecutable: process.execPath,
+			viewerPath: RUN_LEDGER_VIEWER_PATH,
+			infoPath: info.infoFile,
+			journalPath: runLedgerJournalPath(info),
+			rawLogPath: info.logFile,
+		});
+		const viewer = await runCommand(resolveExecutable("herdr", process.env.HERDR_BIN), ["pane", "run", paneId, viewerCommand], info.cwd, 5000);
+		if (viewer.code !== 0) throw new Error((viewer.stderr || viewer.stdout || "Could not start Run Ledger viewer").trim());
 		return { paneId, tabId };
 	}
 
@@ -1214,6 +1412,7 @@ class UnifiedManager {
 			throw new Error(`Cursor ACP session ${info.acpSessionId} cannot reconnect because loadSession was not advertised.`);
 		}
 		if (!info.viewerPaneId || !info.viewerTabId) {
+			this.initializeLedger(info);
 			const viewer = await this.createViewer(info);
 			info.viewerPaneId = viewer.paneId;
 			info.viewerTabId = viewer.tabId;
@@ -1228,6 +1427,8 @@ class UnifiedManager {
 			currentOutput: "",
 			phase: "Starting",
 			activeTools: new Map(),
+			thoughtChunks: 0,
+			thoughtCharacters: 0,
 			promptPermissionPending: false,
 			pendingApprovals: new Map(),
 		};
@@ -1253,6 +1454,7 @@ class UnifiedManager {
 				log(info, "ACP", `${started.loaded ? "loaded" : "created"} ${started.sessionId}`);
 				saveInfo(info);
 			}
+			this.appendLedger(info, { kind: "runtime", state: info.status, detail: "runtime ready" });
 			this.refresh();
 			return live;
 		} catch (error) {
@@ -1297,7 +1499,7 @@ class UnifiedManager {
 		live.currentOutput = "";
 		live.candidateError = undefined;
 		live.phase = "Thinking";
-		live.activeTools.clear();
+		this.terminalizeActiveTools(live, "interrupted");
 		live.promptPermissionPending = false;
 		const generation = live.generation;
 		info.status = "running";
@@ -1308,6 +1510,10 @@ class UnifiedManager {
 		delete info.error;
 		delete info.completedAt;
 		try { unlinkSync(info.responseFile); } catch {}
+		this.flushThought(live);
+		this.appendLedger(info, { kind: "runtime", state: "running", detail: "turn started" });
+		this.appendLedger(info, { kind: "task", synopsis: displayMessage });
+		this.appendLedger(info, { kind: "phase", name: "Thinking" });
 		saveInfo(info);
 		log(info, "user", displayMessage);
 		this.refresh();
@@ -1342,23 +1548,35 @@ class UnifiedManager {
 	private handlePiEvent(live: RuntimeHandle, event: any): void {
 		if (live.closing) return;
 		if (event.type === "text") {
+			this.flushThought(live);
 			live.currentOutput += event.text;
 			this.setPhase(live, "Writing response");
 			log(live.info, "assistant", event.text);
 		} else if (event.type === "thought") {
 			this.setPhase(live, "Thinking");
+			this.bufferThought(live, event.text);
 			log(live.info, "thought", event.text);
 		} else if (event.type === "tool_start") {
-			this.mutateActivity(live, () => live.activeTools.set(String(event.id), compactActivityText(String(event.name), 80) || "tool"));
+			this.flushThought(live);
+			this.mutateActivity(live, () => live.activeTools.set(event.id, compactActivityText(event.name, 80) || "tool"));
+			this.appendLedger(live.info, { kind: "tool-start", id: event.id, name: event.name, input: event.input });
 			log(live.info, "tool", event.name);
+		} else if (event.type === "tool_update") {
+			this.flushThought(live);
+			if (live.activeTools.has(event.id)) this.appendLedger(live.info, { kind: "tool-update", id: event.id, status: event.status, count: event.partialResult === undefined ? undefined : opaqueToolValueCount(event.partialResult) });
+			else this.appendLedger(live.info, { kind: "phase", name: "Observed Pi tool update", detail: event.id });
 		} else if (event.type === "tool_end") {
-			this.mutateActivity(live, () => {
-				live.activeTools.delete(String(event.id));
-				if (live.activeTools.size === 0) live.phase = "Thinking";
-			});
+			this.flushThought(live);
+			if (live.activeTools.has(event.id)) {
+				this.mutateActivity(live, () => { live.activeTools.delete(event.id); if (live.activeTools.size === 0) live.phase = "Thinking"; });
+				this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status, result: event.result, isError: event.isError });
+			} else this.appendLedger(live.info, { kind: "phase", name: "Observed Pi tool end", detail: event.id });
+		} else if (event.type === "tool_observed") {
+			this.flushThought(live); this.appendLedger(live.info, { kind: "phase", name: event.phase });
 		} else if (event.type === "phase") {
 			this.setPhase(live, event.phase);
 		} else if (event.type === "settled" && live.pending) {
+			this.flushThought(live);
 			this.finalize(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error);
 		}
 		live.info.lastActivity = Date.now();
@@ -1370,30 +1588,32 @@ class UnifiedManager {
 			const update = message.params?.update;
 			const kind = update?.sessionUpdate;
 			if (kind === "agent_message_chunk") {
-				const text = contentText(update.content);
-				live.currentOutput += text;
-				this.setPhase(live, "Writing response");
-				log(live.info, "assistant", text);
+				const text = contentText(update.content); this.flushThought(live); live.currentOutput += text;
+				this.setPhase(live, "Writing response"); log(live.info, "assistant", text);
 			} else if (kind === "agent_thought_chunk") {
-				this.setPhase(live, "Thinking");
-				log(live.info, "thought", contentText(update.content));
+				const text = contentText(update.content); this.setPhase(live, "Thinking"); this.bufferThought(live, text); log(live.info, "thought", text);
 			} else if (kind === "tool_call" || kind === "tool_call_update") {
-				const id = String(update.toolCallId ?? update.toolCall?.toolCallId ?? update.toolCall?.id ?? update.title ?? "tool");
+				this.flushThought(live);
+				const tool = normalizeCursorToolUpdate(update);
+				if (tool?.type === "tool_start") {
+					this.mutateActivity(live, () => live.activeTools.set(tool.id, compactActivityText(tool.name, 80) || "tool"));
+					this.appendLedger(live.info, { kind: "tool-start", id: tool.id, name: tool.name, input: tool.input });
+				} else if (tool?.type === "tool_update") {
+					if (live.activeTools.has(tool.id)) this.appendLedger(live.info, { kind: "tool-update", id: tool.id, status: tool.status, count: tool.partialResult === undefined ? undefined : opaqueToolValueCount(tool.partialResult) });
+					else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool update", detail: tool.id });
+				} else if (tool?.type === "tool_end") {
+					if (live.activeTools.has(tool.id)) {
+						this.mutateActivity(live, () => { live.activeTools.delete(tool.id); if (live.activeTools.size === 0) live.phase = "Thinking"; });
+						this.appendLedger(live.info, { kind: "tool-end", id: tool.id, status: tool.status, result: tool.result, isError: tool.isError });
+					} else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool end", detail: tool.id });
+				} else if (tool?.type === "tool_observed") this.appendLedger(live.info, { kind: "phase", name: tool.phase });
 				const title = compactActivityText(update.title ?? update.toolCall?.title ?? update.toolCall?.name ?? "tool", 80) || "tool";
-				const status = String(update.status ?? update.toolCall?.status ?? "").toLowerCase();
-				this.mutateActivity(live, () => {
-					if (["completed", "failed", "cancelled", "canceled"].includes(status)) {
-						live.activeTools.delete(id);
-						if (live.activeTools.size === 0) live.phase = "Thinking";
-					} else live.activeTools.set(id, title);
-				});
 				log(live.info, "tool", title);
 			} else if (kind) log(live.info, kind, JSON.stringify(update).slice(0, 2000));
 		} else if (message.method === "cursor/update_todos") {
 			log(live.info, "todos", JSON.stringify(message.params?.todos ?? []).slice(0, 2000));
 		} else log(live.info, message.method ?? "notification", JSON.stringify(message.params ?? {}).slice(0, 2000));
-		live.info.lastActivity = Date.now();
-		saveInfo(live.info);
+		live.info.lastActivity = Date.now(); saveInfo(live.info);
 	}
 
 	private async handleCursorRequest(live: RuntimeHandle, message: JsonRpcMessage): Promise<unknown> {
@@ -1409,18 +1629,29 @@ class UnifiedManager {
 		const options = normalizePermissionOptions(params);
 		const summary = redactPermissionPayload(params);
 		const mode = live.info.permissionMode ?? "agent";
+		this.flushThought(live);
 		log(live.info, "permission", summary);
-		if (mode === "allow-once" || mode === "deny") return resolveAutomaticPermission(mode, options);
+		this.appendLedger(live.info, { kind: "permission", status: "pending", summary });
+		if (mode === "allow-once" || mode === "deny") {
+			const result = resolveAutomaticPermission(mode, options);
+			this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
+			return result;
+		}
 		if (mode === "prompt") {
 			const ctx = this.ctx;
-			if (!ctx?.hasUI) return rejectPermissionResult(options);
+			if (!ctx?.hasUI) {
+				const result = rejectPermissionResult(options);
+				this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
+				return result;
+			}
 			live.promptPermissionPending = true;
 			this.updateWidget();
 			try {
-				const labels = options.map((option) => option.name ?? option.optionId);
+				const labels = permissionSelectLabels(options);
 				const selected = await ctx.ui.select(`Cursor ${live.info.canonicalName} — ${summary}`, labels, { timeout: PERMISSION_TIMEOUT_MS });
-				const option = options[labels.indexOf(selected ?? "")];
-				return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : rejectPermissionResult(options);
+				const result = resolvePromptPermissionSelection(options, selected ?? undefined);
+				this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result), summary });
+				return result;
 			} finally {
 				live.promptPermissionPending = false;
 				this.updateWidget();
@@ -1437,6 +1668,7 @@ class UnifiedManager {
 					pending,
 					() => rejectPermissionResult(options),
 					`${approvalId} timed out and was rejected`,
+					"expired",
 				);
 				this.updateWidget();
 			}, PERMISSION_TIMEOUT_MS);
@@ -1460,16 +1692,21 @@ class UnifiedManager {
 	private finalize(live: RuntimeHandle, status: "completed" | "failed", output: string, error?: string): void {
 		if (live.closing || !live.pending) return;
 		live.pending = false;
-		live.activeTools.clear();
+		this.flushThought(live);
+		this.terminalizeActiveTools(live, finalizeActiveToolStatus(status));
 		this.rejectApprovals(live, false, "agent completed");
 		live.promptPermissionPending = false;
 		live.info.status = status;
-		live.info.finalResponse = output.trim();
+		live.info.finalResponse = output;
 		live.info.error = error;
 		live.info.completedAt = Date.now();
 		live.info.lastActivity = Date.now();
 		if (live.info.finalResponse) writePrivate(live.info.responseFile, live.info.finalResponse);
 		log(live.info, "turn", error ? `failed: ${error}` : "completed");
+		if (error) this.appendLedger(live.info, { kind: "error", message: error });
+		if (live.info.finalResponse) this.appendLedger(live.info, { kind: "response", text: live.info.finalResponse });
+		this.appendLedger(live.info, { kind: "runtime", state: status });
+		this.appendLedger(live.info, { kind: "completion", status, summary: error ?? live.info.finalResponse });
 		saveInfo(live.info);
 		this.pushMail(this.completionEvent(live.info));
 		this.scheduleIdleClose(live.info);
@@ -1549,7 +1786,7 @@ class UnifiedManager {
 		);
 	}
 
-	private settleApproval<T>(live: RuntimeHandle, approval: PendingApproval, resolveDecision: () => T, note: string): T {
+	private settleApproval<T>(live: RuntimeHandle, approval: PendingApproval, resolveDecision: () => T, note: string, terminalReason?: "expired" | "cancelled"): T {
 		const decision = resolveAndSettlePermission(
 			this.mailbox,
 			this.permissionMailKey(live, approval.id),
@@ -1561,6 +1798,8 @@ class UnifiedManager {
 			},
 		);
 		log(live.info, "permission", note);
+		const result = decision as PermissionResult;
+		this.appendLedger(live.info, { kind: "permission", status: permissionJournalStatus(result, terminalReason), summary: approval.summary });
 		return decision;
 	}
 
@@ -1572,6 +1811,7 @@ class UnifiedManager {
 				approval,
 				() => cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options),
 				`${approval.id} ${cancelled ? "cancelled" : "rejected"}: ${reason}`,
+				cancelled ? "cancelled" : undefined,
 			);
 		}
 		live.promptPermissionPending = false;
@@ -1583,12 +1823,18 @@ class UnifiedManager {
 		this.live.delete(live.info.id);
 		const wasPending = live.pending;
 		live.pending = false;
+		this.flushThought(live);
+		this.terminalizeActiveTools(live, "failed");
 		this.rejectApprovals(live, false, "runtime exited");
 		if (wasPending && !FINAL.has(live.info.status)) {
 			live.info.status = "failed";
 			live.info.error = error?.message ?? "Subagent runtime exited unexpectedly.";
 			live.info.completedAt = Date.now();
 			live.info.lastActivity = Date.now();
+			this.flushThought(live);
+			this.appendLedger(live.info, { kind: "error", message: live.info.error });
+			this.appendLedger(live.info, { kind: "runtime", state: "failed" });
+			this.appendLedger(live.info, { kind: "completion", status: "failed", summary: live.info.error });
 			saveInfo(live.info);
 			this.pushMail(this.completionEvent(live.info));
 			this.scheduleIdleClose(live.info);
@@ -1627,6 +1873,9 @@ class UnifiedManager {
 		info.status = "closed";
 		info.closedAt = Date.now();
 		info.lastActivity = Date.now();
+		const active = this.live.get(info.id); if (active) { this.flushThought(active); this.terminalizeActiveTools(active, "closed"); }
+		this.appendLedger(info, { kind: "runtime", state: "closed" });
+		this.appendLedger(info, { kind: "completion", status: "closed", summary: "agent closed" });
 		saveInfo(info);
 		log(info, "lifecycle", "auto-closed after 15 minutes idle");
 		await this.closeLive(id, true);
@@ -1640,6 +1889,8 @@ class UnifiedManager {
 		if (!live) return;
 		live.closing = true;
 		live.pending = false;
+		this.flushThought(live);
+		this.terminalizeActiveTools(live, "closed");
 		this.rejectApprovals(live, false, "agent closed");
 		await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]);
 		if (remove) this.live.delete(id);
@@ -1666,7 +1917,9 @@ class UnifiedManager {
 
 	private setPhase(live: RuntimeHandle, phase: string): void {
 		if (live.phase === phase) return;
+		this.flushThought(live);
 		this.mutateActivity(live, () => { live.phase = phase; });
+		this.appendLedger(live.info, { kind: "phase", name: phase });
 	}
 
 	private refresh(): void {

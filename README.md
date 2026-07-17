@@ -189,7 +189,8 @@ Runtime data is stored under:
 ├── agents/*.md
 └── runs/<parent-session-hash>/
     ├── <id>.info.json
-    ├── <id>.events.log
+    ├── <id>.events.log       # raw, legacy-compatible event transcript
+    ├── <id>.viewer.jsonl     # private (0600) bounded semantic Run Ledger
     ├── <id>.response.txt
     └── <id>.session.jsonl   # Pi backend
 ```
@@ -251,7 +252,7 @@ The explicit `backend` passed to `spawn_agent` must agree with the template. Pi 
 
 ## UI and Herdr
 
-Every live backend gets a background Herdr event-viewer tab. These tabs are viewers only and are not registered as Herdr agents.
+Every newly created backend gets a background Herdr **Run Ledger** viewer tab. These tabs are viewers only and are not registered as Herdr agents. The built-in viewer follows the private semantic journal with a compact identity/status/task header, thought previews, response chunks, tool lifecycle and permission/error/completion state. It falls back safely to the legacy raw event log when a journal is absent, partial, or unusable. Existing tabs and the Pi overlay remain raw-log based in this phase; no overlay controls or behavior changed.
 
 - `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline that switches to a compact final-response summary after settlement.
 - `/subagent <task-name>` opens one current-session agent.
@@ -266,7 +267,9 @@ This package and every child agent run with your full system permissions. There 
 
 - Pi children load only explicitly selected skills/extensions, but their tools can still mutate the working tree.
 - Cursor ACP permission handling does not sandbox approved operations.
-- Event logs can contain prompts, thoughts, output, and paths. Permission payloads are redacted to summaries.
+- Raw `.events.log` files retain their existing forensic behavior and can contain prompts, thoughts, output, and paths. The Pi overlay continues reading them unchanged.
+- The private `.viewer.jsonl` journal is created mode `0600`. It stores versioned, bounded, terminal-safe/redacted semantic summaries only: never raw thought chunks, raw command text, tool arguments, or tool output. Thought entries retain only a generic/heading preview plus counts. Tool commands use a small semantic allowlist (for example `npm test`); otherwise only a program label and character count are stored. Tool updates retain status/counts, and outcomes retain allowlisted structural metadata or opaque character counts. Raw details remain solely in the legacy log.
+- Cursor ACP fidelity is limited to fields the protocol explicitly supplies. Title-only tool updates are observed but are not correlated into a fabricated lifecycle; Cursor's current ACP limitations (notably no resume/close) still apply.
 - Cursor model changes temporarily touch `~/.cursor/cli-config.json`; the package restores and verifies the previous content.
 
 ## Migration from 0.1.x
