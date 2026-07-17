@@ -653,6 +653,13 @@ function own(object: Record<string, unknown> | undefined, key: string): unknown 
 	return object && Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
 }
 
+/** Keep only the ACP capability bit used for reconnect decisions. */
+export function sanitizeAcpCapabilities(value: unknown): { loadSession?: boolean } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const loadSession = own(value as Record<string, unknown>, "loadSession");
+	return typeof loadSession === "boolean" ? { loadSession } : undefined;
+}
+
 /** Cursor ACP fields are only accepted from explicit ID/input/output members, never titles. */
 export function normalizeCursorToolUpdate(updateValue: unknown): NormalizedBackendToolEvent | undefined {
 	const update = updateValue && typeof updateValue === "object" ? updateValue as Record<string, unknown> : undefined;
@@ -1021,7 +1028,7 @@ class UnifiedManager {
 				});
 				const started = await this.withCursorConfig(() => live.cursor!.start(agent.cursorModel as CursorModel ?? DEFAULT_CURSOR_MODEL, { sessionId: agent.acpSessionId }));
 				if (!this.matching(live, false)) { await this.discardFreshRuntime(live); return; }
-				this.mutate(parent, (current) => updateAgentRuntimeResources(current, agent.id, { acpSessionId: started.sessionId, acpCapabilities: started.agentCapabilities }, this.now()));
+				this.mutate(parent, (current) => updateAgentRuntimeResources(current, agent.id, { acpSessionId: started.sessionId, acpCapabilities: sanitizeAcpCapabilities(started.agentCapabilities) ?? null }, this.now()));
 			}
 			if (!this.matching(live, false)) { await this.discardFreshRuntime(live); return; }
 			this.mutate(parent, (current) => {

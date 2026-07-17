@@ -7,6 +7,7 @@ import {
 	formatPersistentWidgetMetadata,
 	JsonlDecoder,
 	normalizeCursorToolUpdate,
+	sanitizeAcpCapabilities,
 	normalizePiRpcToolEvent,
 	permissionJournalStatus,
 	opaqueToolValueCount,
@@ -350,6 +351,12 @@ test("Cursor tool normalization never correlates title-only updates and uses exp
 	const observed = normalizeCursorToolUpdate({ sessionUpdate: "tool_call_update", title: "same title", status: "completed", output: "unavailable" });
 	assert.equal(observed?.type, "tool_observed");
 	assert.match(observed?.type === "tool_observed" ? observed.phase : "", /same title/);
+});
+
+test("Cursor ACP capabilities retain only the reconnect bit", () => {
+	assert.deepEqual(sanitizeAcpCapabilities({ loadSession: true, mcpCapabilities: { tools: true }, promptCapabilities: { image: true } }), { loadSession: true });
+	assert.deepEqual(sanitizeAcpCapabilities({ loadSession: false, unsafe: "discard" }), { loadSession: false });
+	assert.equal(sanitizeAcpCapabilities({ mcpCapabilities: {} }), undefined);
 });
 
 

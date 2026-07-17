@@ -79,7 +79,7 @@ function cursorFactory(runtimes: FakeRuntimes): UnifiedSubagentDependencies["cre
 	return (cwd, handlers) => {
 		runtimes.cursor.set(cwd, { handlers });
 		return {
-			async start() { return { sessionId: "cursor-session", model: "Auto", configOptions: [], agentCapabilities: {}, loaded: false }; },
+			async start() { return { sessionId: "cursor-session", model: "Auto", configOptions: [], agentCapabilities: { loadSession: true, mcpCapabilities: { tools: true } }, loaded: false }; },
 			async prompt(message, token) { const runtime = runtimes.cursor.get(cwd)!; runtime.message = message; runtime.token = token; return new Promise(() => {}); },
 			cancel() {}, async close() {},
 		};
