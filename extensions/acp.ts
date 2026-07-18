@@ -107,7 +107,7 @@ const HERDR_ENV_KEYS = [
 	"HERDR_PANE_ID",
 ] as const;
 
-/** Strip Herdr pane identity so Cursor's Herdr hook does not report against Pi's pane. */
+/** Strip Herdr pane identity so any child agent cannot report against Pi's parent pane. */
 export function childEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const env = { ...base };
 	for (const key of HERDR_ENV_KEYS) {

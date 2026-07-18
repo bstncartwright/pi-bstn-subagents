@@ -5,6 +5,7 @@ import { delimiter, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import type { PiRuntimeAgent, PiSessionStats } from "./unified-deps.ts";
+import { childEnvironment } from "./acp.ts";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 function statsNumber(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined; }
@@ -169,7 +170,7 @@ export class PiRpcClient {
 		for (const skill of this.info.skillPaths ?? []) args.push("--skill", skill);
 		for (const extension of this.info.extensionPaths ?? []) args.push("--extension", extension);
 		this.log("spawn", `${launch.command} ${args.join(" ")}`);
-		this.proc = spawn(launch.command, args, { cwd: this.info.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+		this.proc = spawn(launch.command, args, { cwd: this.info.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: childEnvironment() });
 		const decoder = new JsonlDecoder();
 		this.proc.stdout.on("data", (chunk) => { for (const line of decoder.push(chunk)) this.handleLine(line); });
 		this.proc.stdout.on("end", () => { for (const line of decoder.end()) this.handleLine(line); });
@@ -292,4 +293,3 @@ export class PiRpcClient {
 		this.onExit(error);
 	}
 }
-

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { registerUnifiedSubagents } from "../extensions/unified.ts";
 import type {
@@ -98,7 +99,7 @@ class Gate {
 
 interface ProjectionCapture { pi: Array<Record<string, unknown>>; herdr: Array<Record<string, unknown>>; }
 
-function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean; viewerCloseGate?: Gate; failViewerCloseFor?: Set<string>; projections?: ProjectionCapture; mutateProjections?: boolean } = {}): UnifiedSubagentDependencies {
+function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean; viewerCloseGate?: Gate; failViewerCloseFor?: Set<string>; projections?: ProjectionCapture; mutateProjections?: boolean; productionHerdr?: boolean } = {}): UnifiedSubagentDependencies {
 	let tick = 1_000;
 	let id = 0;
 	const herdr: HerdrOperations = {
@@ -122,7 +123,7 @@ function dependencies(root: string, events: string[], runtimes: FakeRuntimes, ob
 	return {
 		clock: () => ++tick, uuid: () => `fake-${++id}`,
 		paths: { root, configPath: join(root, "config.json"), agentsDir: join(root, "agents"), runsDir: join(root, "runs"), cursorConfigPath: join(root, "cursor.json") },
-		herdr, onReady: observer,
+		...(options.productionHerdr ? {} : { herdr }), onReady: observer,
 		createPiRuntime: (info, handlers) => {
 			const safe = { ...info, skillPaths: info.skillPaths ? [...info.skillPaths] : undefined, extensionPaths: info.extensionPaths ? [...info.extensionPaths] : undefined };
 			options.projections?.pi.push({ ...info });
@@ -143,6 +144,7 @@ async function execute(api: ReturnType<typeof fakeApi>, name: string, params: un
 async function turn() { await new Promise<void>((resolve) => setImmediate(resolve)); }
 const execFileAsync = promisify(execFile);
 async function git(cwd: string, ...args: string[]) { return execFileAsync("git", args, { cwd, encoding: "utf8" }); }
+const fixtureDirectory = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 test("registered template catalog is trust-gated, prompt-safe, project-preferred, and hot-read by spawn", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-unified-templates-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
@@ -202,6 +204,19 @@ test("managed worktree spawn is backend-neutral and close preserves or removes c
 
 		const reload = await execute(api, "spawn_agent", { task_name: "reload-retain", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); await api.emit("session_shutdown"); assert.ok(existsSync(reload.details.worktree.worktree_root), "shutdown must retain managed worktree");
 	} finally { await observer.shutdown().catch(() => undefined); await rm(base, { recursive: true, force: true }); }
+});
+
+test("production Herdr command boundary creates, runs, reports, and closes a semantic viewer", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-boundary-")); const bin = join(root, "bin"); await mkdir(bin); const herdr = join(bin, "herdr"); const piVersion = join(bin, "pi-version"); const record = join(root, "herdr.jsonl");
+	await writeFile(herdr, `#!${process.execPath}\nimport ${JSON.stringify(pathToFileURL(join(fixtureDirectory, "mock-herdr.mjs")).href)};\n`); await writeFile(piVersion, `#!${process.execPath}\nif (process.argv.includes('--version')) { console.log('pi mock 1.0'); process.exit(0); } process.exit(2);\n`); chmodSync(herdr, 0o700); chmodSync(piVersion, 0o700);
+	const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "HERDR_BIN", "PI_SUBAGENT_PI_BIN", "MOCK_HERDR_RECORD"] as const; const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])); Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace", HERDR_PANE_ID: "parent-pane", HERDR_BIN: herdr, PI_SUBAGENT_PI_BIN: piVersion, MOCK_HERDR_RECORD: record });
+	const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver; registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }, { productionHerdr: true })); const ctx = context("herdr-parent", root);
+	try {
+		await api.emit("session_start", {}, ctx); await execute(api, "spawn_agent", { task_name: "herdr", message: "x", backend: "pi" }, ctx); await turn(); runtimes.settlePi("/herdr"); await execute(api, "wait_agent", { targets: ["herdr"] }, ctx); await execute(api, "close_agent", { target: "herdr" }, ctx); await api.emit("session_shutdown");
+		const calls = readFileSync(record, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]); const create = calls.findIndex((args) => args[0] === "tab" && args[1] === "create"); const run = calls.findIndex((args) => args[0] === "pane" && args[1] === "run"); const close = calls.findIndex((args) => args[0] === "tab" && args[1] === "close"); assert.ok(create >= 0 && run > create && close > run, JSON.stringify(calls)); assert.match(calls[run]![3] ?? "", /run-ledger-viewer\.ts.*--journal/); assert.ok(calls.some((args) => args[0] === "pane" && (args[1] === "report-agent" || args[1] === "release-agent")));
+	} finally {
+		await observer.shutdown().catch(() => undefined); for (const key of keys) { const value = previous[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; } await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("registered tools remain detached, isolated, serialized, and observable through the narrow test observer", async () => {

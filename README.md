@@ -312,7 +312,10 @@ If the package was installed under `pi-cursor-herdr-subagents`, remove that pack
 ```bash
 npm install
 npm run check
+npm pack --dry-run
 ```
+
+The test suite is offline and deterministic. It includes real parent-Pi RPC extension loading under an isolated home, a mock child-Pi JSONL process, a mock Herdr argv boundary, mock Cursor ACP, real temporary Git repositories/worktrees, package extraction/import, and TTY snapshots. CI runs the engine floor (Node 22.19) and Node 24 on Ubuntu plus Node 24 on macOS; it never requires model credentials, Cursor login, or a Herdr daemon.
 
 ## Attribution
 
