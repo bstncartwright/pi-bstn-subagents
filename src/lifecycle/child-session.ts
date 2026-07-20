@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { SessionMessage } from "#src/types";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 
 export type SubagentBackend = "pi" | "cursor";
 export type CursorPermissionMode = "prompt" | "allow-once" | "deny";
@@ -58,6 +59,8 @@ export interface ChildSession {
   readonly outputFile: string | undefined;
   readonly supportsResume: boolean;
   readonly supportsSteer: boolean;
+  /** Actual model negotiated for this session, once the backend has created it. */
+  readonly modelIdentity?: SubagentModelIdentity;
   /** Pi-only compatibility handle. Cursor intentionally leaves this absent. */
   readonly session?: unknown;
 

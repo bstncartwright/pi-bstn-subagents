@@ -55,6 +55,7 @@ export async function runForeground(
     const toolUses = recordRef?.toolUses ?? 0;
     const details: AgentDetails = {
       ...presentation.detailBase,
+      model: recordRef?.model,
       toolUses,
       tokens: recordRef ? formatLifetimeTokens(recordRef) : "",
       // Read activity off the record; fall back to safe defaults before onSessionCreated fires
@@ -132,6 +133,7 @@ export async function runForeground(
 
   const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
   const statsParts = [`${record.toolUses} tool uses`];
+  if (record.model) statsParts.unshift(`model: ${record.model.displayName}`);
   if (tokenText) statsParts.push(tokenText);
   return textResult(
     `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getStatusNote(record.status)}.\n\n` +

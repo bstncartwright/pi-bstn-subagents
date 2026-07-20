@@ -190,6 +190,13 @@ describe("renderCompleted", () => {
 		expect(result).toContain("\n[dim:  line two]");
 	});
 
+	it("shows the exact backend value only in expanded detail", () => {
+		const details = makeDetails({ model: { backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5" } });
+		expect(renderCompleted(details, "done", false, theme)).toContain("Composer 2.5");
+		expect(renderCompleted(details, "done", false, theme)).not.toContain("composer-2.5");
+		expect(renderCompleted(details, "done", true, theme)).toContain("model: Composer 2.5 (composer-2.5)");
+	});
+
 	it("expanded view truncates to 50 lines and adds overflow message", () => {
 		const details = makeDetails({ status: "completed", durationMs: 2000 });
 		const manyLines = Array.from({ length: 55 }, (_, i) => `line ${i + 1}`).join("\n");

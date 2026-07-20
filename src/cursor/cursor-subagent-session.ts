@@ -11,6 +11,7 @@ import type {
   TurnLoopResult,
 } from "#src/lifecycle/child-session";
 import type { ChildLifecyclePublisher } from "#src/lifecycle/child-lifecycle";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 
 export interface CursorSubagentSessionOptions {
   client: CursorAcpClient;
@@ -21,6 +22,7 @@ export interface CursorSubagentSessionOptions {
   parentContext?: string;
   transcriptPath: string;
   lifecycle: ChildLifecyclePublisher;
+  modelIdentity?: SubagentModelIdentity;
 }
 
 interface ToolState {
@@ -50,6 +52,7 @@ export class CursorAcpSubagentSession implements ChildSession {
   readonly supportsSteer = false;
   readonly outputFile: string;
   readonly sessionId: string;
+  readonly modelIdentity: SubagentModelIdentity | undefined;
 
   private readonly listeners = new Set<(event: ChildSessionEvent) => void>();
   private readonly transcript: CursorTranscript;
@@ -63,6 +66,7 @@ export class CursorAcpSubagentSession implements ChildSession {
   constructor(private readonly options: CursorSubagentSessionOptions) {
     this.sessionId = options.sessionId;
     this.outputFile = options.transcriptPath;
+    this.modelIdentity = options.modelIdentity;
     this.transcript = new CursorTranscript(options.transcriptPath);
   }
 

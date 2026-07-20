@@ -41,6 +41,7 @@ import {
 import type { AgentConfigLookup } from "#src/config/agent-types";
 import type { SessionMessage } from "#src/types";
 import { describeActivity, type Theme } from "#src/ui/display";
+import { formatCompactModel, formatExpandedModel } from "#src/ui/model-display";
 import { fileSnapshotSource, listNavigableAgents, liveSource, type NavigableSubagent, type TranscriptSource } from "#src/ui/session-navigation";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +111,7 @@ export class SessionNavigatorHandler {
 
     let source: TranscriptSource;
     try {
-      source = entry.kind === "live" ? liveSource(entry.record) : fileSnapshotSource(entry.outputFile, readFile, entry.backend);
+			source = entry.kind === "live" ? liveSource(entry.record) : fileSnapshotSource(entry.outputFile, readFile, entry.backend, entry.model);
     } catch {
       ui.notify("Could not read the session transcript file.", "error");
       return;
@@ -211,7 +212,8 @@ export class TranscriptOverlay implements Component {
     const hrMid = row(th.fg("dim", "─".repeat(innerW)));
 
     lines.push(hrTop);
-    lines.push(row(`${th.bold("Subagent session")} ${th.fg("dim", `· ${this.source.backend}`)}`));
+		const model = formatExpandedModel(this.source.model) ?? formatCompactModel(this.source.model);
+    lines.push(row(`${th.bold("Subagent session")} ${th.fg("dim", `· ${this.source.backend}${model ? ` · ${model}` : ""}`)}`));
     lines.push(hrMid);
 
     const contentLines = this.buildContentLines(innerW);

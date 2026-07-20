@@ -1,6 +1,7 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { NotificationDetails } from "#src/observation/notification";
 import { formatMs, formatTokens, formatTurns } from "#src/ui/display";
+import { formatCompactModel, formatExpandedModel } from "#src/ui/model-display";
 
 /** Narrow theme interface — only the methods the renderer actually calls. */
 interface RendererTheme {
@@ -38,12 +39,14 @@ export function resolveStatusPresentation(status: string): StatusPresentation {
 /** Fields `buildStatsParts` reads from a `NotificationDetails`. */
 type StatsSource = Pick<
   NotificationDetails,
-  "backend" | "turnCount" | "maxTurns" | "toolUses" | "totalTokens" | "durationMs"
+  "backend" | "model" | "turnCount" | "maxTurns" | "toolUses" | "totalTokens" | "durationMs"
 >;
 
 /** Assemble the stats-line parts (turns, tool uses, tokens, duration), omitting zero fields. */
 export function buildStatsParts(d: StatsSource): string[] {
   const parts: string[] = [];
+	const model = formatCompactModel(d.model);
+	if (model) parts.push(model);
   if (d.backend !== "cursor" && d.turnCount > 0) parts.push(formatTurns(d.turnCount, d.maxTurns));
   if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
   if (d.totalTokens > 0) parts.push(formatTokens(d.totalTokens));
@@ -91,6 +94,11 @@ export function createNotificationRenderer() {
     // Line 4: output file link (if present)
     if (d.outputFile) {
       line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
+    }
+
+    if (expanded) {
+      const model = formatExpandedModel(d.model);
+      if (model) line += "\n  " + theme.fg("muted", `model: ${model}`);
     }
 
     return new Text(line, 0, 0);

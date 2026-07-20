@@ -9,11 +9,14 @@
 
 import type { SubagentStatus } from "#src/lifecycle/subagent";
 import type { SubagentBackend } from "#src/types";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
+import { formatCompactModel, formatExpandedModel } from "#src/ui/model-display";
 
 /** The data a get_subagent_result report renders from — only what the formatter reads. */
 export interface AgentReport {
 	id: string;
 	backend: SubagentBackend;
+	model?: SubagentModelIdentity;
 	displayName: string;
 	status: SubagentStatus;
 	toolUses: number;
@@ -54,8 +57,10 @@ export function renderReportBody(report: AgentReport): string {
 export function formatAgentReport(report: AgentReport): string {
 	let output =
 		`Agent: ${report.id}\n` +
-		`Type: ${report.displayName} | Backend: ${report.backend} | Status: ${report.status} | ${renderStatsParts(report).join(" | ")}\n` +
+		`Type: ${report.displayName} | Backend: ${report.backend}${formatCompactModel(report.model) ? ` | Model: ${formatCompactModel(report.model)}` : ""} | Status: ${report.status} | ${renderStatsParts(report).join(" | ")}\n` +
 		`Description: ${report.description}\n\n`;
+	const model = formatExpandedModel(report.model);
+	if (model) output += `Model: ${model}\n\n`;
 	output += renderReportBody(report);
 	if (report.conversation) {
 		output += `\n\n--- Agent Conversation ---\n${report.conversation}`;

@@ -85,6 +85,13 @@ boundary tells the caller to list live Cursor values, then retry with
 `backend: "cursor"` and `cursor_model: "<advertised value>"`, omitting Pi-only
 `model`, `thinking`, and `max_turns` fields.
 
+After `session/new`, `session/load`, or `session/resume` (and after an optional
+model config update), the final advertised model option's `currentValue` is
+captured as the resolved Cursor model identity. Compact surfaces show its ACP
+display name; persisted records, events, notifications, and expanded results
+also retain that exact `currentValue`. Before an omitted-model session finishes
+negotiating, background output omits a model rather than inventing `default`.
+
 ## Testing
 
 The normal suite uses a subprocess mock that exercises initialization,

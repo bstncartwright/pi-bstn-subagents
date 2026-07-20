@@ -564,6 +564,21 @@ describe("Subagent.run() — happy path", () => {
 		expect(callOrder).toEqual(["started", "sessionCreated", "runFinished"]);
 	});
 
+	it("captures the actual model before onSessionCreated and retains it after release", async () => {
+		const stub = { ...createSubagentSessionStub(), modelIdentity: {
+			backend: "cursor" as const, displayName: "Auto", value: "auto",
+		} };
+		const factory: SessionFactory = vi.fn(async () => toSubagentSession(stub));
+		let observed: unknown;
+		const agent = createRunnableAgent({ createSubagentSession: factory, observer: {
+			onSessionCreated: (record) => { observed = record.model; },
+		} });
+		await agent.run();
+		expect(observed).toEqual({ backend: "cursor", displayName: "Auto", value: "auto" });
+		agent.releaseSession();
+		expect(agent.model).toEqual({ backend: "cursor", displayName: "Auto", value: "auto" });
+	});
+
 	it("sets the subagentSession with a session", async () => {
 		const agent = createRunnableAgent();
 		await agent.run();

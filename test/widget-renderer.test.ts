@@ -67,6 +67,12 @@ describe("renderFinishedLine", () => {
 		expect(line).not.toContain("turn ");
 	});
 
+	it("shows the compact actual model beside the backend", () => {
+		const line = renderFinishedLine(makeAgent({ model: { backend: "cursor", displayName: "Auto", value: "auto" } }), testRegistry, theme);
+		expect(line).toContain("Auto");
+		expect(line).not.toContain("value: auto");
+	});
+
 	it("renders singular tool use", () => {
 		const agent = makeAgent({ toolUses: 1 });
 		const line = renderFinishedLine(agent, testRegistry, theme);

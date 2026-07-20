@@ -17,7 +17,9 @@ import type { AgentConfigLookup } from "#src/config/agent-types";
 import type { SubagentStatus } from "#src/lifecycle/subagent-state";
 import type { ChildSessionEvent, SessionMessage, SubagentBackend, SubagentType } from "#src/types";
 import type { ChildTranscript, TextTranscriptEntry } from "#src/lifecycle/child-session";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 import { formatDuration, getDisplayName } from "#src/ui/display";
+import { formatCompactModel } from "#src/ui/model-display";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -25,6 +27,7 @@ import { formatDuration, getDisplayName } from "#src/ui/display";
 export interface NavigableSubagent {
   readonly id: string;
   readonly backend: SubagentBackend;
+	readonly model?: SubagentModelIdentity;
   readonly type: SubagentType;
   readonly description: string;
   readonly status: SubagentStatus;
@@ -52,11 +55,12 @@ export interface NavigableSubagent {
  */
 export type NavigationEntry =
   | { readonly kind: "live"; readonly label: string; readonly record: NavigableSubagent }
-  | { readonly kind: "snapshot"; readonly label: string; readonly outputFile: string; readonly backend: SubagentBackend };
+  | { readonly kind: "snapshot"; readonly label: string; readonly outputFile: string; readonly backend: SubagentBackend; readonly model?: SubagentModelIdentity };
 
 /** The fields `buildLabel` reads — shared by the live and snapshot (released-session) label paths. */
 interface LabelFields {
   readonly backend: SubagentBackend;
+	readonly model?: SubagentModelIdentity;
   readonly type: SubagentType;
   readonly description: string;
   readonly status: SubagentStatus;
@@ -75,6 +79,7 @@ export interface StreamingState {
 export interface TranscriptSource {
   /** Backend that produced this transcript. */
   readonly backend: SubagentBackend;
+	readonly model?: SubagentModelIdentity;
   readonly kind: "pi" | "text";
   /** Current message history. */
   getMessages(): readonly SessionMessage[];
@@ -103,7 +108,7 @@ export function listNavigableAgents(
     if (record.isSessionReady()) {
       live.push({ kind: "live", record, label: buildLabel(record, registry) });
     } else if (record.outputFile) {
-      snapshots.push({ kind: "snapshot", outputFile: record.outputFile, backend: record.backend, label: buildLabel(record, registry, true) });
+      snapshots.push({ kind: "snapshot", outputFile: record.outputFile, backend: record.backend, model: record.model, label: buildLabel(record, registry, true) });
     }
   }
   return [...live, ...snapshots];
@@ -123,6 +128,7 @@ export function fileSnapshotSource(
   outputFile: string,
   readFile: (path: string) => string,
   backend: SubagentBackend = "pi",
+	model?: SubagentModelIdentity,
 ): TranscriptSource {
   if (backend === "cursor") {
     const entries = readFile(outputFile)
@@ -131,6 +137,7 @@ export function fileSnapshotSource(
       .map((line) => JSON.parse(line) as TextTranscriptEntry);
     return {
       backend,
+		model,
       kind: "text",
       getMessages: () => [],
       getTextEntries: () => entries,
@@ -144,6 +151,7 @@ export function fileSnapshotSource(
   const { messages } = buildSessionContext(sessionEntries);
   return {
     backend,
+		model,
     kind: "pi",
     getMessages: () => messages,
     getTextEntries: () => [],
@@ -163,6 +171,7 @@ export function liveSource(record: NavigableSubagent): TranscriptSource {
   const initial = transcript();
   return {
     backend: record.backend,
+		model: record.model,
     kind: initial?.kind ?? (record.backend === "cursor" ? "text" : "pi"),
     getMessages: () => {
       const current = transcript();
@@ -188,5 +197,6 @@ function buildLabel(fields: LabelFields, registry: AgentConfigLookup, released =
   const name = getDisplayName(fields.type, registry);
   const duration = formatDuration(fields.startedAt, fields.completedAt);
   const marker = released ? " · session released (snapshot)" : "";
-  return `${name} (${fields.backend}) · ${fields.description} · ${fields.toolUses} tools · ${fields.status} · ${duration}${marker}`;
+  const model = formatCompactModel(fields.model);
+  return `${name} (${fields.backend})${model ? ` · ${model}` : ""} · ${fields.description} · ${fields.toolUses} tools · ${fields.status} · ${duration}${marker}`;
 }

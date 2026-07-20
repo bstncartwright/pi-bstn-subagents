@@ -1,6 +1,7 @@
 import type { AgentConfigLookup } from "#src/config/agent-types";
 import { getLifetimeTotal, type LifetimeUsage } from "#src/lifecycle/usage";
 import { type AgentDetails, formatTokens } from "#src/ui/display";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 
 /** Parenthetical status note for completed agent result text. */
 export function getStatusNote(status: string): string {
@@ -30,6 +31,7 @@ export function buildDetails(
     /** Live-activity counters — exposed as getters on Subagent (Phase 18 Step 2). */
     turnCount?: number;
     maxTurns?: number;
+    model?: SubagentModelIdentity;
   },
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -43,6 +45,7 @@ export function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    model: record.model,
     ...overrides,
   };
 }

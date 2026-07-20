@@ -16,6 +16,7 @@ import type {
 	SubagentBackend,
 	TurnLoopResult,
 } from "#src/lifecycle/child-session";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 import type { CreateSubagentSessionParams } from "#src/lifecycle/create-subagent-session";
 import type { ParentSnapshot } from "#src/lifecycle/parent-snapshot";
 import { RunListeners } from "#src/lifecycle/run-listeners";
@@ -121,6 +122,8 @@ export class Subagent {
 	get responseText(): string { return this.state.responseText; }
 	get backend(): SubagentBackend { return this.subagentSession?.backend ?? this.execution.backend ?? "pi"; }
 	get maxTurns(): number | undefined { return this.execution.maxTurns; }
+	/** Actual negotiated model. Retained after the heavy child session is released. */
+	get model(): SubagentModelIdentity | undefined { return this._modelIdentity; }
 
 	readonly abortController: AbortController;
 	private _promise?: Promise<void>;
@@ -131,6 +134,7 @@ export class Subagent {
 	private readonly workspaceBracket: WorkspaceBracket;
 
 	subagentSession?: ChildSession;
+	private _modelIdentity?: SubagentModelIdentity;
 
 	// Retained after releaseSession() disposes the heavy session, so outputFile
 	// (transcript pointer) survives and the resume path can tell "released" from
@@ -296,6 +300,10 @@ export class Subagent {
 			this.failRun(err);
 			return;
 		}
+
+		// Capture before any observer can render this record. This survives release,
+		// and is intentionally independent from requested invocation configuration.
+		this._modelIdentity = this.subagentSession.modelIdentity;
 
 		this.flushPendingSteers();
 		this.listeners.attachObserver(subscribeSubagentObserver(this.subagentSession, this.state, {

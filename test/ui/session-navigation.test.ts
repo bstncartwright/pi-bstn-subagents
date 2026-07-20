@@ -53,10 +53,19 @@ describe("listNavigableAgents", () => {
     expect(entry.label).toBe("Agent (pi) · Investigate the bug · 3 tools · completed · 3.0s");
   });
 
-  it("identifies Cursor sessions in the picker", () => {
+	it("identifies Cursor sessions in the picker", () => {
     const [entry] = listNavigableAgents([makeNavigable({ backend: "cursor" })], registry);
     expect(entry.label).toContain("Agent (cursor)");
-  });
+	});
+
+	it("shows the compact actual model in the picker label", () => {
+		const [entry] = listNavigableAgents([makeNavigable({
+			backend: "cursor",
+			model: { backend: "cursor", displayName: "Auto", value: "auto" },
+		})], registry);
+		expect(entry.label).toContain("(cursor)");
+		expect(entry.label).toContain("· Auto ·");
+	});
 
   it("orders live entries before snapshot ones", () => {
     const live = makeNavigable({ id: "live-1", isSessionReady: () => true });

@@ -3,6 +3,7 @@
 import { basename } from "node:path";
 import type { AgentReport } from "#src/tools/get-result-report";
 import type { Theme } from "#src/ui/display";
+import { formatCompactModel, formatExpandedModel } from "#src/ui/model-display";
 
 function statusPresentation(status: AgentReport["status"], theme: Theme): string {
 	switch (status) {
@@ -52,7 +53,8 @@ function resultBody(report: AgentReport, expanded: boolean, theme: Theme): strin
 /** Render a compact summary by default and reveal durable details when expanded. */
 export function renderGetResult(report: AgentReport, expanded: boolean, theme: Theme): string {
 	const backend = theme.fg("dim", `(${report.backend})`);
-	const header = `${statusPresentation(report.status, theme)}  ${theme.bold(report.displayName)} ${backend}`;
+	const model = formatCompactModel(report.model);
+	const header = `${statusPresentation(report.status, theme)}  ${theme.bold(report.displayName)} ${backend}${model ? ` ${theme.fg("dim", `· ${model}`)}` : ""}`;
 	const lines = [
 		header,
 		`${theme.fg("muted", report.description)} ${theme.fg("dim", "·")} ${compactStats(report, theme)}`,
@@ -62,6 +64,10 @@ export function renderGetResult(report: AgentReport, expanded: boolean, theme: T
 
 	if (report.conversation && expanded) {
 		lines.push("", theme.fg("accent", "Conversation"), ...report.conversation.split("\n"));
+	}
+	if (expanded) {
+		const exactModel = formatExpandedModel(report.model);
+		if (exactModel) lines.push("", theme.fg("dim", `model  ${exactModel}`));
 	}
 	if (report.transcriptPath) {
 		const path = expanded ? report.transcriptPath : `…/tasks/${basename(report.transcriptPath)}`;

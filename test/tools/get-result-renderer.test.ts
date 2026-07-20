@@ -51,6 +51,12 @@ describe("renderGetResult", () => {
 		expect(expanded).toContain("[dim:(cursor)]");
 	});
 
+	it("shows compact and exact model forms at their respective detail levels", () => {
+		const model = { backend: "cursor" as const, displayName: "Auto", value: "auto" };
+		expect(renderGetResult(report({ model }), false, theme)).toContain("Auto");
+		expect(renderGetResult(report({ model }), true, theme)).toContain("model  Auto (auto)");
+	});
+
 	it("shows errors without presenting them as successful output", () => {
 		const text = renderGetResult(report({ status: "error", error: "timeout" }), false, theme);
 		expect(text).toContain("[error:✗ error]");

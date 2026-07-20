@@ -109,6 +109,13 @@ describe("formatAgentReport", () => {
 		);
 	});
 
+	it("keeps the exact actual model in durable text output", () => {
+		const text = formatAgentReport(makeReport({
+			model: { backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5" },
+		}));
+		expect(text).toContain("Model: Composer 2.5 (composer-2.5)");
+	});
+
 	it("appends the conversation block when present", () => {
 		const text = formatAgentReport(
 			makeReport({ conversation: "[User]: hello" }),

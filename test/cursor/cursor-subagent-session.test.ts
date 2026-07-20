@@ -41,6 +41,17 @@ function fixture(promptResponse: PromptResponse = { stopReason: "end_turn" }) {
 }
 
 describe("CursorAcpSubagentSession", () => {
+	it("exposes the ACP-negotiated model identity", () => {
+		const { session } = fixture();
+		expect(session.modelIdentity).toBeUndefined();
+		const identified = new CursorAcpSubagentSession({
+			client: fixture().client,
+			sessionId: "cursor-model", sessionDir: "/tmp", agentName: "reviewer", systemPrompt: "x", transcriptPath: "/tmp/cursor-model.jsonl",
+			lifecycle: fixture().lifecycle,
+			modelIdentity: { backend: "cursor", displayName: "Auto", value: "auto" },
+		});
+		expect(identified.modelIdentity).toEqual({ backend: "cursor", displayName: "Auto", value: "auto" });
+	});
   it("normalizes message, tool, usage, and context events", async () => {
     const { client, session } = fixture({
       stopReason: "end_turn",

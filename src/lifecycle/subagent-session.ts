@@ -23,6 +23,7 @@ import type {
   TurnLoopResult,
 } from "#src/lifecycle/child-session";
 import type { ChildLifecyclePublisher } from "#src/lifecycle/child-lifecycle";
+import { piModelIdentity, type SubagentModelIdentity } from "#src/lifecycle/model-identity";
 import { normalizeMaxTurns } from "#src/lifecycle/turn-limits";
 import { getSessionContextPercent, type SessionStatsLike } from "#src/lifecycle/usage";
 import { extractText } from "#src/session/context";
@@ -74,6 +75,10 @@ export class SubagentSession implements ChildSession {
 
   get outputFile(): string | undefined {
     return this.meta.outputFile;
+  }
+
+  get modelIdentity(): SubagentModelIdentity | undefined {
+    return piModelIdentity((this._session as AgentSession & { model?: unknown }).model);
   }
 
   /** Drive the initial run's turn loop; emits `completed` on success. */

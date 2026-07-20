@@ -17,6 +17,7 @@ import type {
   ResumeSessionResponse,
   SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 
 export interface CursorAcpClientOptions {
   command?: string;
@@ -41,6 +42,8 @@ export interface CursorAcpStarted {
   capabilities: AgentCapabilities;
   configOptions: SessionConfigOption[];
   model?: string;
+  /** Actual model from the final ACP config option, including omitted requests. */
+  modelIdentity?: SubagentModelIdentity;
   loaded: boolean;
 }
 
@@ -114,6 +117,22 @@ export function resolveCursorModelValue(
     (candidate) => fuzzyKey(candidate.value) === key || fuzzyKey(candidate.name) === key,
   );
   return fuzzy.length === 1 ? { value: fuzzy[0]!.value, name: fuzzy[0]!.name } : undefined;
+}
+
+/** Read the negotiated model from ACP's final config response. */
+export function cursorModelIdentity(
+  options: readonly SessionConfigOption[],
+): SubagentModelIdentity | undefined {
+  const option = findCursorModelOption(options);
+  if (!option || option.type !== "select" || typeof option.currentValue !== "string" || !option.currentValue) {
+    return undefined;
+  }
+  const choice = extractCursorModelChoices(option).find((candidate) => candidate.value === option.currentValue);
+  return {
+    backend: "cursor",
+    displayName: choice?.name ?? option.currentValue,
+    value: option.currentValue,
+  };
 }
 
 export class CursorAcpClient {
@@ -262,6 +281,7 @@ export class CursorAcpClient {
         capabilities: this.capabilities,
         configOptions,
         model: selectedModel,
+        modelIdentity: cursorModelIdentity(configOptions),
         loaded,
       };
     } catch (error) {

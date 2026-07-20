@@ -128,8 +128,9 @@ describe("resolveSpawnConfig — model resolution", () => {
     );
     if ("error" in result) return;
     expect(result.execution.model).toBe(parentModel);
-    // modelName is undefined when same as parent
-    expect(result.presentation.modelName).toBeUndefined();
+    // Pre-session presentation retains the inherited model; the created session
+    // later replaces this fallback with its actual identity.
+    expect(result.presentation.modelName).toBe("Claude Sonnet");
   });
 
   it("returns error when user-specified model cannot be resolved", () => {
@@ -215,7 +216,7 @@ describe("resolveSpawnConfig — invocation fields", () => {
     );
     if ("error" in result) return;
     expect(result.execution.agentInvocation).toEqual({
-      modelName: undefined,
+      modelName: "Claude Sonnet",
       thinking: "high",
       maxTurns: undefined,
       inheritContext: false,

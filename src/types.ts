@@ -5,12 +5,13 @@
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SessionContext as SdkSessionContext } from "@earendil-works/pi-coding-agent";
 import type { ChildSessionEvent, CursorPermissionMode, SubagentBackend } from "#src/lifecycle/child-session";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 import type { ModelRegistry } from "#src/session/model-resolver";
 
 
 export type { SteerOutcome } from "#src/lifecycle/subagent";
 export { Subagent } from "#src/lifecycle/subagent";
-export type { ChildSessionEvent, CursorPermissionMode, SubagentBackend, ThinkingLevel };
+export type { ChildSessionEvent, CursorPermissionMode, SubagentBackend, SubagentModelIdentity, ThinkingLevel };
 
 /**
  * One message in a child session's history, typed from Pi's `SessionContext`.

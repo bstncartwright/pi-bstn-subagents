@@ -7,6 +7,7 @@
 
 import type { AgentConfigLookup } from "#src/config/agent-types";
 import type { AgentInvocation, SubagentBackend, SubagentType } from "#src/types";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 
 // ---- Types ----
 
@@ -31,6 +32,8 @@ export interface AgentDetails {
   spinnerFrame?: number;
   /** Short model name if different from parent (e.g. "haiku", "sonnet"). */
   modelName?: string;
+  /** Actual model identity captured from the created child session. */
+  model?: SubagentModelIdentity;
   /** Notable config tags (e.g. ["thinking: high", "inherit context"]). */
   tags?: string[];
   /** Current turn count. */

@@ -11,6 +11,15 @@ import { createMockSession, createSubagentSessionStub, toSubagentSession } from 
 import { STUB_SNAPSHOT } from "#test/helpers/stub-ctx";
 
 describe("toSubagentRecord", () => {
+	it("exports the actual negotiated model without replacing legacy fields", () => {
+		const record = createTestSubagent();
+		Object.defineProperty(record, "model", {
+			get: () => ({ backend: "pi", displayName: "gpt-5.6-sol", value: "openai-codex/gpt-5.6-sol" }),
+		});
+		expect(toSubagentRecord(record).model).toEqual({
+			backend: "pi", displayName: "gpt-5.6-sol", value: "openai-codex/gpt-5.6-sol",
+		});
+	});
   const baseRecord = (() => {
     const r = createTestSubagent({
       id: "abc-123",

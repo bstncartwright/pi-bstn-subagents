@@ -8,6 +8,7 @@
 
 import type { AgentDetails, Theme } from "#src/ui/display";
 import { formatMs, formatTurns, SPINNER } from "#src/ui/display";
+import { formatCompactModel, formatExpandedModel } from "#src/ui/model-display";
 
 // ---- Dispatcher ----
 
@@ -40,7 +41,8 @@ export function renderRunning(details: AgentDetails, theme: Theme): string {
 
 /** Render background launch status. */
 export function renderBackground(details: AgentDetails, theme: Theme): string {
-	return theme.fg("dim", `  \u23BF  Running in background (ID: ${details.agentId})`);
+	const model = formatCompactModel(details.model) ?? details.modelName;
+	return theme.fg("dim", `  \u23BF  Running in background (ID: ${details.agentId})${model ? ` · ${model}` : ""}`);
 }
 
 /** Render completed or steered status with optional expanded result text. */
@@ -58,6 +60,8 @@ export function renderCompleted(
 	line += " " + theme.fg("dim", "\u00B7") + " " + theme.fg("dim", duration);
 
 	if (expanded) {
+		const model = formatExpandedModel(details.model);
+		if (model) line += "\n" + theme.fg("muted", `  model: ${model}`);
 		if (resultText) {
 			const lines = resultText.split("\n").slice(0, 50);
 			for (const l of lines) {
@@ -108,7 +112,8 @@ export function renderFailed(details: AgentDetails, theme: Theme): string {
  */
 export function renderStats(details: AgentDetails, theme: Theme): string {
 	const parts: string[] = [];
-	if (details.modelName) parts.push(details.modelName);
+	const model = formatCompactModel(details.model) ?? details.modelName;
+	if (model) parts.push(model);
 	if (details.tags) parts.push(...details.tags);
 	if (details.backend === "pi" && details.turnCount != null && details.turnCount > 0) {
 		parts.push(formatTurns(details.turnCount, details.maxTurns));

@@ -29,6 +29,7 @@ describe("CursorAcpClient", () => {
       const started = await acp.start({ cwd: process.cwd(), model: "Composer 2.5" });
       expect(started.sessionId).toBe("cursor-session-1");
       expect(started.model).toBe("Composer 2.5");
+		expect(started.modelIdentity).toEqual({ backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5" });
       expect(findCursorModelOption(started.configOptions)?.type).toBe("select");
       const result = await acp.prompt("do work");
       expect(result.stopReason).toBe("end_turn");
@@ -51,6 +52,17 @@ describe("CursorAcpClient", () => {
       await acp.close();
     }
   });
+
+	it("captures Cursor's negotiated current model when no model was requested", async () => {
+		const acp = client();
+		try {
+			const started = await acp.start({ cwd: process.cwd() });
+			expect(started.model).toBeUndefined(); // legacy requested-model field
+			expect(started.modelIdentity).toEqual({ backend: "cursor", displayName: "Auto", value: "auto" });
+		} finally {
+			await acp.close();
+		}
+	});
 
   it("uses capability-gated session resume", async () => {
     const acp = client();

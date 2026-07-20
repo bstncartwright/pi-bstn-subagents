@@ -11,6 +11,7 @@
 
 import type { SubagentStatus } from "#src/lifecycle/subagent";
 import type { LifetimeUsage } from "#src/lifecycle/usage";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 import type {
   Workspace,
   WorkspaceDisposeOutcome,
@@ -23,6 +24,7 @@ import type {
 // SubagentStatus is defined in the lifecycle layer (single home) and re-exported
 // here for the public API surface — mirrors the LifetimeUsage / workspace pattern.
 export type { SubagentStatus } from "#src/lifecycle/subagent";
+export type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
 // Generative extension seam (ADR 0002, Phase 16 Step 2). The provider type
 // and all four collaborator types it references are re-exported by name so
 // consumers can import them directly rather than recovering them via
@@ -40,6 +42,8 @@ export type {
 export interface SubagentRecord {
   id: string;
   backend?: "pi" | "cursor";
+	/** Actual model negotiated by the child backend, if session creation completed. */
+  model?: SubagentModelIdentity;
   type: string;
   description: string;
   status: SubagentStatus;

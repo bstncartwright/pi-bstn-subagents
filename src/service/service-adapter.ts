@@ -142,6 +142,7 @@ export function toSubagentRecord(record: Subagent): SubagentRecord {
   };
 
   if (record.backend === "cursor") out.backend = "cursor";
+	if (record.model) out.model = record.model;
 
   if (record.result !== undefined) out.result = record.result;
   if (record.error !== undefined) out.error = record.error;

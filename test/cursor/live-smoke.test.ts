@@ -19,9 +19,11 @@ live("prompts the installed Cursor CLI over ACP", { timeout: 120_000 }, async ()
   try {
     const started = await client.start({
       cwd: process.cwd(),
-      model: process.env.CURSOR_ACP_MODEL,
     });
     expect(findCursorModelOption(started.configOptions)).toBeDefined();
+		const option = findCursorModelOption(started.configOptions);
+		expect(option?.type).toBe("select");
+		if (option?.type === "select") expect(started.modelIdentity?.value).toBe(option.currentValue);
     const result = await client.prompt("Reply exactly CURSOR_ACP_SMOKE_OK. Do not use tools.");
     expect(result.stopReason).toBe("end_turn");
     expect(output).toContain("CURSOR_ACP_SMOKE_OK");

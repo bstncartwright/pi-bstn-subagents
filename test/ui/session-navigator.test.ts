@@ -54,10 +54,16 @@ describe("TranscriptOverlay", () => {
     expect(lines.some((l) => l.includes("Hello world"))).toBe(true);
   });
 
-  it("renders the producing backend in the transcript header", () => {
+	it("renders the producing backend in the transcript header", () => {
     expect(makeOverlay({ source: fakeSource({ backend: "cursor", kind: "text" }) }).render(80).join("\n"))
       .toContain("Subagent session · cursor");
-  });
+	});
+
+	it("renders the actual model and exact value in the transcript header", () => {
+		expect(makeOverlay({ source: fakeSource({
+			backend: "cursor", kind: "text", model: { backend: "cursor", displayName: "Auto", value: "auto" },
+		}) }).render(80).join("\n")).toContain("Subagent session · cursor · Auto (auto)");
+	});
 
   it("subscribes on construction and requests a render on change", () => {
     const tui = mockTui();

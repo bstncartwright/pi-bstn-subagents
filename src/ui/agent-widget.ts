@@ -169,6 +169,7 @@ export class AgentWidget implements SubagentManagerObserver {
       id: record.id,
       type: record.type,
       backend: record.backend,
+		model: record.model,
       status: record.status,
       description: record.description,
       toolUses: record.toolUses,

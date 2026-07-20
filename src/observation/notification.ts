@@ -1,6 +1,8 @@
 import { debugLog } from "#src/debug";
 import { getLifetimeTotal } from "#src/lifecycle/usage";
 import type { Subagent } from "#src/types";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
+import { formatExpandedModel } from "#src/ui/model-display";
 
 /** Details attached to custom notification messages for visual rendering. */
 export interface NotificationDetails {
@@ -16,6 +18,7 @@ export interface NotificationDetails {
   error?: string;
   resultPreview: string;
   backend?: "cursor";
+  model?: SubagentModelIdentity;
 }
 
 // ---- Pure helpers (exported for unit testing) ----
@@ -49,6 +52,7 @@ export function formatTaskNotification(record: Subagent, resultMaxLen: number): 
   const contextPercent = record.getContextPercent();
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
+	const model = formatExpandedModel(record.model);
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -62,6 +66,7 @@ export function formatTaskNotification(record: Subagent, resultMaxLen: number): 
     "<task-notification>",
     `<task-id>${record.id}</task-id>`,
     record.backend === "cursor" ? "<backend>cursor</backend>" : null,
+		model ? `<model>${escapeXml(model)}</model>` : null,
     toolCallId ? `<tool-use-id>${escapeXml(toolCallId)}</tool-use-id>` : null,
     outputFile ? `<output-file>${escapeXml(outputFile)}</output-file>` : null,
     `<status>${escapeXml(status)}</status>`,
@@ -99,6 +104,7 @@ export function buildNotificationDetails(
       : "No output.",
   };
   if (record.backend === "cursor") details.backend = "cursor";
+  if (record.model) details.model = record.model;
   return details;
 }
 
@@ -121,6 +127,7 @@ export function buildEventData(record: Subagent) {
     toolUses: record.toolUses,
     durationMs,
     tokens,
+		...(record.model ? { model: record.model } : {}),
   };
   return record.backend === "cursor" ? { ...data, backend: "cursor" as const } : data;
 }

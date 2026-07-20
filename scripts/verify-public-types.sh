@@ -24,7 +24,7 @@ if grep -q '#src' "$DTS"; then
   grep -n '#src' "$DTS" >&2
   exit 1
 fi
-for sym in getSubagentsService WorkspaceProvider SubagentsService LifetimeUsage Workspace WorkspacePrepareContext WorkspaceDisposeOutcome WorkspaceDisposeResult; do
+for sym in getSubagentsService WorkspaceProvider SubagentsService SubagentRecord SubagentModelIdentity LifetimeUsage Workspace WorkspacePrepareContext WorkspaceDisposeOutcome WorkspaceDisposeResult; do
   grep -q "$sym" "$DTS" || { echo "FAIL: '$sym' missing from dist/public.d.ts" >&2; exit 1; }
 done
 echo "OK: dist/public.d.ts is self-contained and exports the public surface"
@@ -70,6 +70,8 @@ import {
   type WorkspaceDisposeResult,
   type WorkspacePrepareContext,
   type WorkspaceProvider,
+  type SubagentModelIdentity,
+  type SubagentRecord,
 } from "pi-bstn-subagents";
 
 // Exercise the value export and all workspace collaborator type exports.
@@ -87,6 +89,14 @@ const provider: WorkspaceProvider = {
 
 void provider;
 void getSubagentsService;
+
+const model: SubagentModelIdentity = {
+  backend: "cursor",
+  displayName: "Auto",
+  value: "auto",
+};
+const record: Pick<SubagentRecord, "model"> = { model };
+void record;
 TS
 
 cat > "$CONSUMER/probe-settings.ts" <<'TS'

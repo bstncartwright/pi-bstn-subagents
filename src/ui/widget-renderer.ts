@@ -10,6 +10,8 @@ import type { AgentConfigLookup } from "#src/config/agent-types";
 import type { LifetimeUsage } from "#src/lifecycle/usage";
 import { getLifetimeTotal } from "#src/lifecycle/usage";
 import type { SubagentBackend, SubagentType } from "#src/types";
+import type { SubagentModelIdentity } from "#src/lifecycle/model-identity";
+import { formatCompactModel } from "#src/ui/model-display";
 import {
 	describeActivity,
 	formatMs,
@@ -28,6 +30,7 @@ export interface WidgetAgent {
 	readonly id: string;
 	readonly type: SubagentType;
 	readonly backend: SubagentBackend;
+	readonly model?: SubagentModelIdentity;
 	readonly status: string;
 	readonly description: string;
 	readonly toolUses: number;
@@ -79,6 +82,8 @@ export function renderFinishedLine(
 	}
 
 	const parts: string[] = [];
+	const model = formatCompactModel(agent.model);
+	if (model) parts.push(model);
 	if (agent.backend === "pi") parts.push(formatTurns(agent.turnCount, agent.maxTurns));
 	if (agent.toolUses > 0) parts.push(`${agent.toolUses} tool use${agent.toolUses === 1 ? "" : "s"}`);
 	parts.push(duration);
@@ -105,6 +110,8 @@ export function renderRunningLines(
 	const tokenText = tokens > 0 ? formatSessionTokens(tokens, agent.contextPercent, theme, agent.compactionCount) : "";
 
 	const parts: string[] = [];
+	const model = formatCompactModel(agent.model);
+	if (model) parts.push(model);
 	if (agent.backend === "pi") parts.push(formatTurns(agent.turnCount, agent.maxTurns));
 	if (agent.toolUses > 0) parts.push(`${agent.toolUses} tool use${agent.toolUses === 1 ? "" : "s"}`);
 	if (tokenText) parts.push(tokenText);

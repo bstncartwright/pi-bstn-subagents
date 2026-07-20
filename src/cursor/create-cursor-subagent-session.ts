@@ -78,6 +78,7 @@ export async function createCursorSubagentSession(
       parentContext: params.snapshot.parentContext,
       transcriptPath,
       lifecycle: deps.lifecycle,
+      modelIdentity: started.modelIdentity,
     });
     deps.lifecycle.sessionCreated({ sessionId: started.sessionId, parentSessionId, backend: "cursor" });
     for (const notification of queuedUpdates) session.handleNotification(notification);

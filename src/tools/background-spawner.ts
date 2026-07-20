@@ -53,11 +53,13 @@ export function spawnBackground(
   const record = manager.getRecord(id);
 
   const isQueued = record?.status === "queued";
+  const model = record?.model?.displayName ?? presentation.modelName;
   return textResult(
     `Agent ${isQueued ? "queued" : "started"} in background.\n` +
       `Agent ID: ${id}\n` +
       `Type: ${identity.displayName}\n` +
       `Description: ${execution.description}\n` +
+      (model ? `Model: ${model}\n` : "") +
       (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
       (isQueued
         ? `Position: queued (max ${params.settings.maxConcurrent} concurrent)\n`
@@ -67,6 +69,7 @@ export function spawnBackground(
       `Do not duplicate this agent's work.`,
     {
       ...presentation.detailBase,
+      model: record?.model,
       toolUses: 0,
       tokens: "",
       durationMs: 0,

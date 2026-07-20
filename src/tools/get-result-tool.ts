@@ -64,6 +64,7 @@ export class GetResultTool {
 		return {
 			id: record.id,
 			backend: record.backend,
+			model: record.model,
 			displayName: getDisplayName(record.type, this.registry),
 			status: record.status,
 			toolUses: record.toolUses,

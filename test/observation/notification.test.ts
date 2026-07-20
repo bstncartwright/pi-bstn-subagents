@@ -44,6 +44,13 @@ describe("getStatusLabel", () => {
 });
 
 describe("formatTaskNotification", () => {
+	it("includes the durable actual model in XML", () => {
+		const record = createTestSubagent();
+		Object.defineProperty(record, "model", {
+			get: () => ({ backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5" }),
+		});
+		expect(formatTaskNotification(record, 500)).toContain("<model>Composer 2.5 (composer-2.5)</model>");
+	});
   const baseRecord = createTestSubagent();
 
   it("produces valid XML structure", () => {
@@ -142,6 +149,19 @@ describe("buildEventData", () => {
       tokens: { input: 1000, output: 500, total: 1500 },
     });
   });
+
+	it("includes the resolved model when session negotiation completed", () => {
+		const record = createTestSubagent();
+		Object.defineProperty(record, "model", {
+			get: () => ({ backend: "pi", displayName: "gpt-5.6-sol", value: "openai-codex/gpt-5.6-sol" }),
+		});
+
+		expect(buildEventData(record).model).toEqual({
+			backend: "pi",
+			displayName: "gpt-5.6-sol",
+			value: "openai-codex/gpt-5.6-sol",
+		});
+	});
 
   it("omits tokens when total is zero", () => {
     const record = createTestSubagent({ type: "Explore", description: "Search files", result: "Found 3 files", toolUses: 5, lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 } });

@@ -97,6 +97,17 @@ describe("SubagentSession — accessors", () => {
     expect(sub.outputFile).toBe("/out.jsonl");
   });
 
+	it("derives the actual Pi identity from the created SDK session model", () => {
+		const { session } = createSession("X");
+		Object.assign(session, { model: { provider: "openai-codex", id: "gpt-5.6-sol", name: "gpt-5.6-sol" } });
+		const { sub } = makeSubagentSession(session);
+		expect(sub.modelIdentity).toEqual({
+			backend: "pi",
+			displayName: "gpt-5.6-sol",
+			value: "openai-codex/gpt-5.6-sol",
+		});
+	});
+
   it("returns undefined outputFile when none was persisted", () => {
     const { session } = createSession("X");
     const { sub } = makeSubagentSession(session, { outputFile: undefined });

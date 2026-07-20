@@ -29,6 +29,7 @@ This repository vendors and adapts `@gotgenes/pi-subagents` at upstream commit
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work.
   Unknown types fall back to general-purpose with a note
 - **Backend-native model selection** — Pi supports fuzzy configured-model selection; Cursor resolves against the model options advertised by ACP at session creation
+- **Resolved model identity** — every live, completed, transcript, event, and service record shows the model actually negotiated for that child session; compact UI uses its display name and durable details retain the exact Pi `provider/id` or Cursor ACP value
 - **Live model discovery** — parent sessions can list authenticated Pi models and disposable-session Cursor ACP values before selecting either backend
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML.
@@ -87,7 +88,9 @@ subagent({
 
 `cursor_model` is optional. When provided, copy the advertised `value` exactly;
 the tool also shows an exact Cursor spawn call. The extension does not maintain
-a hard-coded Cursor model list.
+a hard-coded Cursor model list. When omitted, Cursor's actual ACP current value
+is captured after session creation and shown as the resolved model; the UI never
+claims a fabricated `default` model while that session is still being negotiated.
 
 ## UI
 
@@ -95,9 +98,9 @@ The extension renders a persistent widget above the editor showing active backgr
 
 ```text
 ● Agents
-├─ ⠹ Agent (pi)  Refactor auth module · turn 5/30 · 5 tool uses · 33.8k token (62%) · 12.3s
+├─ ⠹ Agent (pi)  Refactor auth module · gpt-5.6-sol · turn 5/30 · 5 tool uses · 33.8k token (62%) · 12.3s
 │    ⎿  editing 2 files…
-├─ ⠹ Explore (cursor)  Find auth files · 3 tool uses · 12.4k token · 4.1s
+├─ ⠹ Explore (cursor)  Find auth files · Auto · 3 tool uses · 12.4k token · 4.1s
 │    ⎿  searching…
 ├─ ⠹ Agent (pi)  Long-running task · turn 42 · 38 tool uses · 91.0k token (84% · ↻2) · 2m17s
 │    ⎿  reading…
@@ -309,7 +312,7 @@ Changes persist across pi restarts (see [Persistent Settings](#persistent-settin
 
 ### `/subagents:sessions`
 
-Pick any subagent — running, or completed with its live session already released — and read its full session transcript in pi's native per-entry viewer. The picker and transcript header both identify the producing backend as `pi` or `cursor`.
+Pick any subagent — running, or completed with its live session already released — and read its full session transcript in pi's native per-entry viewer. The picker and transcript header identify the producing backend and resolved model; durable details include Pi's `provider/id` or Cursor's ACP value.
 Read-only: no steering, no session takeover (steering lives in the `steer_subagent` tool and the background widget).
 
 Creating and editing agent definitions is not a command — write an agent `.md` file in your editor, or ask a pi session to generate one (see [Custom Agents](#custom-agents)).
@@ -380,7 +383,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | ---------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `subagents:created`          | Background agent registered                             | `id`, `type`, `description`, `isBackground`                                                                          |
 | `subagents:started`          | Agent transitions to running (including queued→running) | `id`, `type`, `description`                                                                                          |
-| `subagents:completed`        | Agent finished successfully                             | `id`, `type`, `durationMs`, `tokens` (lifetime `{ input, output, total }`), `toolUses`, `result`                     |
+| `subagents:completed`        | Agent finished successfully                             | `id`, `type`, `durationMs`, `tokens` (lifetime `{ input, output, total }`), `toolUses`, `result`, optional resolved `model` |
 | `subagents:failed`           | Agent errored, stopped, or aborted                      | same as completed + `error`, `status`                                                                                |
 | `subagents:steered`          | Steering message sent                                   | `id`, `message`                                                                                                      |
 | `subagents:compacted`        | Agent's session successfully compacted                  | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |

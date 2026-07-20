@@ -138,14 +138,12 @@ export function resolveSpawnConfig(
   const inheritContext = resolvedConfig.inheritContext;
   const runInBackground = resolvedConfig.runInBackground;
 
-  // Compute display model name (only shown when different from parent)
-  const parentModelId = modelInfo.parentModel?.id;
-  const effectiveModelId = model?.id;
+  // A Pi session captures its authoritative identity after creation. This
+  // fallback keeps pre-session/background presentation useful, including an
+  // inherited parent model; never suppress it through id-only comparison.
   const modelName = resolvedConfig.backend === "cursor"
     ? resolvedConfig.cursorModel
-    : effectiveModelId && effectiveModelId !== parentModelId
-      ? model?.name.replace(/^Claude\s+/i, "").toLowerCase()
-      : undefined;
+    : model?.name ?? model?.id;
 
   const effectiveMaxTurns = resolvedConfig.backend === "pi"
     ? normalizeMaxTurns(resolvedConfig.maxTurns ?? settings.defaultMaxTurns)
