@@ -114,10 +114,15 @@ export class SubagentsServiceAdapter implements SubagentsService {
     }
     const resolved = this.resolveModel(modelInput, registry);
     if (typeof resolved === "string") {
-      throw new Error(resolved);
+      throw new Error(withCursorModelRetryGuidance(resolved));
     }
     return resolved;
   }
+}
+
+/** Keep the public service API unchanged while making a common backend mix-up actionable. */
+function withCursorModelRetryGuidance(error: string): string {
+  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" }) to discover its live advertised values. Then retry spawn() with { backend: "cursor", cursorModel: "<advertised value>" }. Omit model, thinkingLevel, and maxTurns.`;
 }
 
 /**

@@ -26,14 +26,17 @@ function configOptions() {
 async function handle(message) {
   const { id, method, params } = message;
   if (method === "initialize") {
-    write({ id, result: {
+    const response = { id, result: {
       protocolVersion: params.protocolVersion,
       agentCapabilities: {
         loadSession: true,
         sessionCapabilities: { resume: {}, close: {} },
       },
       authMethods: [{ id: "cursor_login", name: "Cursor Login", description: "test" }],
-    } });
+    } };
+    const delay = Number(process.env.MOCK_DELAY_INITIALIZE_MS ?? 0);
+    if (delay > 0) setTimeout(() => write(response), delay);
+    else write(response);
     return;
   }
   if (method === "authenticate") {
@@ -50,7 +53,10 @@ async function handle(message) {
   }
   if (method === "session/set_config_option") {
     model = params.value;
-    write({ id, result: { configOptions: configOptions() } });
+    const response = { id, result: { configOptions: configOptions() } };
+    const delay = Number(process.env.MOCK_DELAY_SET_CONFIG_MS ?? 0);
+    if (delay > 0) setTimeout(() => write(response), delay);
+    else write(response);
     return;
   }
   if (method === "session/prompt") {
@@ -94,6 +100,7 @@ async function handle(message) {
     return;
   }
   if (method === "session/close") {
+    if (process.env.MOCK_HANG_SESSION_CLOSE === "1") return;
     write({ id, result: {} });
     return;
   }

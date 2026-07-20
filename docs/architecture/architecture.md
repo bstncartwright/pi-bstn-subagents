@@ -80,6 +80,7 @@ flowchart TB
         SpawnConfig["spawn-config<br/>(resolve params)"]
         FgRunner["foreground-runner"]
         BgSpawner["background-spawner"]
+        ModelDiscovery["list_subagent_models"]
         GetResult["get_subagent_result"]
         Steer["steer_subagent"]
     end
@@ -333,6 +334,7 @@ src/
 │
 ├── tools/                          LLM-facing tool implementations
 │   ├── agent-tool.ts               subagent tool definition, validation, dispatch
+│   ├── list-subagent-models-tool.ts parent-only Pi/Cursor model discovery
 │   ├── result-renderer.ts          pure per-status result rendering
 │   ├── spawn-config.ts             pure config resolution
 │   ├── foreground-runner.ts        foreground execution loop
@@ -341,6 +343,11 @@ src/
 │   ├── get-result-report.ts        pure get_subagent_result report formatter
 │   ├── steer-tool.ts               steer_subagent tool
 │   └── helpers.ts                  shared tool utilities
+│
+├── cursor/                         Cursor ACP protocol integration
+│   ├── acp-client.ts               ACP lifecycle, configuration, and model-choice extraction
+│   ├── discover-cursor-models.ts   disposable live model discovery
+│   └── cursor-subagent-session.ts  normalized Cursor child session
 │
 ├── ui/                             user-facing presentation
 │   ├── agent-widget.ts             above-editor live status widget
@@ -372,7 +379,7 @@ flowchart TD
     subgraph core["@gotgenes/pi-subagents"]
         direction TB
         exports["SubagentsService API<br/>publish / getSubagentsService<br/>SubagentRecord, SubagentStatus"]
-        engine["Tools: subagent, get_subagent_result,<br/>steer_subagent<br/>SubagentManager, createSubagentSession, SubagentSession"]
+        engine["Tools: subagent, list_subagent_models,<br/>get_subagent_result, steer_subagent<br/>SubagentManager, createSubagentSession, SubagentSession"]
         ui_int["Internal UI: widget, session-navigator,<br/>subagents-settings"]
     end
 
@@ -386,7 +393,8 @@ They declare this package as an optional peer dependency and use dynamic import 
 
 ### What the core owns
 
-- The three tools: `subagent` (née `Agent`), `get_subagent_result`, `steer_subagent`.
+- The four tools: `subagent` (née `Agent`), parent-only `list_subagent_models`, `get_subagent_result`, `steer_subagent`.
+- `list_subagent_models` reads authenticated Pi registry entries and opens one disposable Cursor ACP session for dynamic model values. It is intentionally excluded from Pi children and is not part of `SubagentsService`.
 - `SubagentManager` — spawn, abort, resume, collection management, observer wiring.
 - `ConcurrencyLimiter` — background admission gate: schedules run thunks FIFO against a configurable concurrency limit.
 - `createSubagentSession` — assembly factory: session creation and extension binding; returns a born-complete `SubagentSession`.

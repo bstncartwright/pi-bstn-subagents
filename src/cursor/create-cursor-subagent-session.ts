@@ -62,7 +62,11 @@ export async function createCursorSubagentSession(
   });
 
   try {
-    const started = await client.start({ cwd: config.effectiveCwd, model: params.cursorModel });
+    const started = await client.start({
+      cwd: config.effectiveCwd,
+      model: params.cursorModel,
+      signal: params.signal,
+    });
     const sessionDir = deps.deriveSessionDir(params.parentSession?.parentSessionFile, config.effectiveCwd);
     const transcriptPath = join(sessionDir, `cursor-${safeSessionId(started.sessionId)}.jsonl`);
     session = new CursorAcpSubagentSession({
@@ -79,7 +83,7 @@ export async function createCursorSubagentSession(
     for (const notification of queuedUpdates) session.handleNotification(notification);
     return session;
   } catch (error) {
-    await client.close();
+    await client.close({ graceful: !params.signal?.aborted });
     throw error;
   }
 }

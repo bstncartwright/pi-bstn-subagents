@@ -1,10 +1,13 @@
+import type { AgentToolResult, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import type { AgentConfigLookup } from "#src/config/agent-types";
 import { type AgentReport, formatAgentReport } from "#src/tools/get-result-report";
-import { formatLifetimeTokens, textResult } from "#src/tools/helpers";
+import { renderGetResult, renderGetResultCall } from "#src/tools/get-result-renderer";
+import { formatLifetimeTokens } from "#src/tools/helpers";
 import type { Subagent } from "#src/types";
-import { formatDuration, getDisplayName } from "#src/ui/display";
+import { formatDuration, getDisplayName, type Theme } from "#src/ui/display";
 
 // ---- Deps interfaces ----
 
@@ -23,13 +26,19 @@ export class GetResultTool {
 	async execute(
 		_toolCallId: string,
 		params: { agent_id: string; wait?: boolean; verbose?: boolean },
-		_signal: AbortSignal,
+		_signal: AbortSignal | undefined,
 		_onUpdate: unknown,
 		_ctx: unknown,
 	) {
 		const record = this.manager.getRecord(params.agent_id);
 		if (!record) {
-			return textResult(`Agent not found: "${params.agent_id}". Records are cleared at session start/switch, so it may be from a previous session.`);
+			return {
+				content: [{
+					type: "text" as const,
+					text: `Agent not found: "${params.agent_id}". Records are cleared at session start/switch, so it may be from a previous session.`,
+				}],
+				details: undefined as AgentReport | undefined,
+			};
 		}
 
 		// Wait for completion if requested.
@@ -44,12 +53,17 @@ export class GetResultTool {
 			record.markConsumed();
 		}
 
-		return textResult(formatAgentReport(this.buildReport(record, params.verbose)));
+		const report = this.buildReport(record, params.verbose);
+		return {
+			content: [{ type: "text" as const, text: formatAgentReport(report) }],
+			details: report,
+		};
 	}
 
 	private buildReport(record: Subagent, verbose?: boolean): AgentReport {
 		return {
 			id: record.id,
+			backend: record.backend,
 			displayName: getDisplayName(record.type, this.registry),
 			status: record.status,
 			toolUses: record.toolUses,
@@ -92,10 +106,27 @@ export class GetResultTool {
 					}),
 				),
 			}),
+			renderCall(
+				args: { agent_id?: string; wait?: boolean; verbose?: boolean },
+				theme: Theme,
+			) {
+				return new Text(renderGetResultCall(args, theme), 0, 0);
+			},
+			renderResult(
+				result: AgentToolResult<AgentReport | undefined>,
+				{ expanded }: ToolRenderResultOptions,
+				theme: Theme,
+			) {
+				if (!result.details) {
+					const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+					return new Text(theme.fg("error", text), 0, 0);
+				}
+				return new Text(renderGetResult(result.details, expanded, theme), 0, 0);
+			},
 			execute: (
 				toolCallId: string,
 				params: { agent_id: string; wait?: boolean; verbose?: boolean },
-				signal: AbortSignal,
+				signal: AbortSignal | undefined,
 				onUpdate: unknown,
 				ctx: unknown,
 			) => this.execute(toolCallId, params, signal, onUpdate, ctx),

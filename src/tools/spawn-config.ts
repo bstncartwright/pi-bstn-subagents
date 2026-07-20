@@ -125,7 +125,13 @@ export function resolveSpawnConfig(
       modelInfo.modelRegistry,
     )
     : { model: undefined, error: undefined };
-  if (resolution.error) return { error: resolution.error };
+  if (resolution.error) {
+    return {
+      error: resolvedConfig.backend === "pi" && resolvedConfig.modelFromParams
+        ? withCursorModelRetryGuidance(resolution.error)
+        : resolution.error,
+    };
+  }
   const model = resolution.model;
 
   const thinking = resolvedConfig.backend === "pi" ? resolvedConfig.thinking : undefined;
@@ -187,4 +193,13 @@ export function resolveSpawnConfig(
     },
     presentation: { modelName, agentTags, detailBase },
   };
+}
+
+/**
+ * Keep the resolver's generic error stable while making the tool boundary
+ * recoverable when a caller accidentally supplies a Cursor display name as a
+ * Pi `model` override (for example, "Auto").
+ */
+function withCursorModelRetryGuidance(error: string): string {
+  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" }) to discover its live advertised values. Then retry with subagent({ backend: "cursor", cursor_model: "<advertised value>", subagent_type: "general-purpose", prompt: "...", description: "..." }). Omit model, thinking, and max_turns.`;
 }

@@ -9,6 +9,7 @@ import {
 function makeReport(overrides: Partial<AgentReport> = {}): AgentReport {
 	return {
 		id: "agent-1",
+		backend: "pi",
 		displayName: "General",
 		status: "completed",
 		toolUses: 3,
@@ -102,7 +103,7 @@ describe("formatAgentReport", () => {
 		);
 		expect(text).toBe(
 			"Agent: agent-1\n" +
-				"Type: General | Status: completed | Tool uses: 3 | 33.8k token | Context: 43% | Compactions: 1 | Duration: 12.3s\n" +
+				"Type: General | Backend: pi | Status: completed | Tool uses: 3 | 33.8k token | Context: 43% | Compactions: 1 | Duration: 12.3s\n" +
 				"Description: Investigate the bug\n\n" +
 				"All done.",
 		);

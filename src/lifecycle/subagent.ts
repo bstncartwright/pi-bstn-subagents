@@ -289,6 +289,7 @@ export class Subagent {
 				permissionMode: this.execution.permissionMode,
 				requestPermission: this.execution.requestPermission,
 				thinkingLevel: this.execution.thinkingLevel,
+				signal: this.abortController.signal,
 			});
 		} catch (err) {
 			// The factory disposed its own session on a post-creation failure.

@@ -29,7 +29,7 @@ import { type AssemblerIO, assembleSessionConfig } from "#src/session/session-co
 import type { ParentSessionInfo, ShellExec, SubagentType, ThinkingLevel } from "#src/types";
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
-const EXCLUDED_TOOL_NAMES = ["subagent", "get_subagent_result", "steer_subagent"];
+const EXCLUDED_TOOL_NAMES = ["subagent", "get_subagent_result", "list_subagent_models", "steer_subagent"];
 
 /**
  * Apply the recursion guard: remove this extension's dispatch tools from the
@@ -171,6 +171,8 @@ export interface CreateSubagentSessionParams {
   permissionMode?: CursorPermissionMode;
   requestPermission?: CursorPermissionPrompt;
   thinkingLevel?: ThinkingLevel;
+  /** The owning Subagent's internal cancellation signal. */
+  signal?: AbortSignal;
 }
 
 /**

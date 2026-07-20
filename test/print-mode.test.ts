@@ -81,6 +81,11 @@ describe("print mode background notifications", () => {
 
     const { pi, tools, handlers } = makePi();
     subagentsExtension(pi);
+    expect(tools.has("list_subagent_models")).toBe(true);
+    expect(tools.get("list_subagent_models")?.promptSnippet).toContain("before selecting a subagent model");
+    expect(tools.get("list_subagent_models")?.promptGuidelines).toContain(
+      "Use list_subagent_models before setting subagent model or cursor_model; do not guess Cursor model values.",
+    );
     vi.useFakeTimers();
 
     // Fire session_start so runtime.currentCtx is populated for buildSnapshot

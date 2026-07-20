@@ -571,6 +571,16 @@ describe("Subagent.run() — happy path", () => {
 		expect(agent.subagentSession!.session).toBeDefined();
 	});
 
+	it("passes its internal abort signal into session creation", async () => {
+		const { factory } = createFactory();
+		const agent = createRunnableAgent({ createSubagentSession: factory });
+
+		await agent.run();
+
+		const params = (factory as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+		expect(params.signal).toBe(agent.abortController.signal);
+	});
+
 	it("flushes pending steers when session is created", async () => {
 		const agent = createRunnableAgent();
 		// A steer arriving while the agent is running but the session is not yet

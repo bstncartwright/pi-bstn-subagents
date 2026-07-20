@@ -43,6 +43,7 @@ import { deriveSubagentSessionDir } from "#src/session/session-dir";
 import { SettingsManager } from "#src/settings";
 import { AgentTool } from "#src/tools/agent-tool";
 import { GetResultTool } from "#src/tools/get-result-tool";
+import { ListSubagentModelsTool } from "#src/tools/list-subagent-models-tool";
 import { SteerTool } from "#src/tools/steer-tool";
 import { AgentWidget } from "#src/ui/agent-widget";
 import { SessionNavigatorHandler } from "#src/ui/session-navigator";
@@ -165,6 +166,10 @@ export default function (pi: ExtensionAPI) {
   // ---- get_subagent_result tool ----
 
   pi.registerTool(new GetResultTool(manager, registry).toToolDefinition());
+
+  // ---- list_subagent_models tool (parent-only; Pi children exclude it) ----
+
+  pi.registerTool(new ListSubagentModelsTool().toToolDefinition());
 
   // ---- steer_subagent tool ----
 

@@ -141,6 +141,22 @@ describe("resolveSpawnConfig — model resolution", () => {
     );
     expect("error" in result && result.error).toBeTruthy();
   });
+
+  it("guides an explicit Pi model miss toward live Cursor discovery without changing resolver fallback behavior", () => {
+    const result = resolveSpawnConfig(
+      { subagent_type: "general-purpose", prompt: "test", description: "d", model: "Auto" },
+      testRegistry,
+      makeModelInfo({ modelRegistry: { find: () => undefined, getAll: () => [], getAvailable: () => [] } }),
+      defaultSettings,
+    );
+    expect(result).toEqual({
+      error: expect.stringContaining('The default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" })'),
+    });
+    if ("error" in result) {
+      expect(result.error).toContain('subagent({ backend: "cursor", cursor_model: "<advertised value>"');
+      expect(result.error).toContain("Omit model, thinking, and max_turns.");
+    }
+  });
 });
 
 describe("resolveSpawnConfig — max turns normalization", () => {

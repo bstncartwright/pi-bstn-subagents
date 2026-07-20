@@ -232,7 +232,7 @@ describe("createSubagentSession — post-bind recursion guard", () => {
     },
     {
       name: "excludes EXCLUDED_TOOL_NAMES while keeping other tools",
-      toolsAfterBind: ["read", "subagent", "get_subagent_result", "steer_subagent", "external"],
+      toolsAfterBind: ["read", "subagent", "get_subagent_result", "list_subagent_models", "steer_subagent", "external"],
       expected: ["read", "external"],
     },
     {

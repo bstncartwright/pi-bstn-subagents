@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { CursorAcpClient, findCursorModelOption } from "#src/cursor/acp-client";
+import { discoverCursorModels } from "#src/cursor/discover-cursor-models";
 
 const live = process.env.CURSOR_ACP_LIVE === "1" ? it : it.skip;
 
@@ -27,4 +28,11 @@ live("prompts the installed Cursor CLI over ACP", { timeout: 120_000 }, async ()
   } finally {
     await client.close();
   }
+});
+
+live("discovers live Cursor ACP model values without prompting", { timeout: 60_000 }, async () => {
+  const models = await discoverCursorModels({ cwd: process.cwd() });
+
+  expect(models.length).toBeGreaterThan(0);
+  expect(models.some((model) => model.value.length > 0 && model.name.length > 0)).toBe(true);
 });

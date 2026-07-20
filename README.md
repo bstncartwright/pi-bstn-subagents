@@ -29,6 +29,7 @@ This repository vendors and adapts `@gotgenes/pi-subagents` at upstream commit
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work.
   Unknown types fall back to general-purpose with a note
 - **Backend-native model selection** — Pi supports fuzzy configured-model selection; Cursor resolves against the model options advertised by ACP at session creation
+- **Live model discovery** — parent sessions can list authenticated Pi models and disposable-session Cursor ACP values before selecting either backend
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML.
   Expandable to show full output
@@ -66,6 +67,13 @@ Background agents return an ID immediately and notify you on completion.
 
 Cursor's `agent` CLI must be installed and authenticated (`agent --version`).
 
+Discover the live Cursor values first; Cursor's display names are not a stable
+package catalog:
+
+```text
+list_subagent_models({ backend: "cursor" })
+```
+
 ```text
 subagent({
   backend: "cursor",
@@ -77,9 +85,9 @@ subagent({
 })
 ```
 
-`cursor_model` is optional. When provided, it is matched against the model
-configuration values advertised by the running Cursor ACP server. The extension
-does not maintain a hard-coded Cursor model list.
+`cursor_model` is optional. When provided, copy the advertised `value` exactly;
+the tool also shows an exact Cursor spawn call. The extension does not maintain
+a hard-coded Cursor model list.
 
 ## UI
 
@@ -228,6 +236,21 @@ If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, or `r
 `subagent` tool parameters only fill fields the agent config leaves unspecified.
 
 ## Tools
+
+### `list_subagent_models`
+
+Discover models before setting `model` or `cursor_model`. Omit `backend` to
+list both authenticated/available Pi models and live Cursor ACP choices.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `backend` | string | no | `pi` or `cursor`; omit for both |
+
+Cursor discovery opens one disposable ACP session, sends no prompt, and closes
+it before returning. The output includes each ACP `name`, exact `value`, current
+selection, and a copyable `subagent({ backend: "cursor", cursor_model: ... })`
+call. If Cursor discovery fails in an unfiltered call, available Pi models are
+still returned with a warning.
 
 ### `subagent`
 

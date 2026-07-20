@@ -1,7 +1,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { CursorAcpClient, findCursorModelOption, resolveCursorModelValue } from "#src/cursor/acp-client";
+import {
+  CursorAcpClient,
+  extractCursorModelChoices,
+  findCursorModelOption,
+  resolveCursorModelValue,
+} from "#src/cursor/acp-client";
 
 const mockAgent = join(dirname(fileURLToPath(import.meta.url)), "../fixtures/mock-cursor-acp.mjs");
 
@@ -64,7 +69,50 @@ describe("CursorAcpClient", () => {
       .rejects.toThrow(/Available: Auto, Composer 2.5/);
     expect(acp.isAlive).toBe(false);
   });
+
+  it("propagates startup cancellation without waiting for the request timeout", async () => {
+    const controller = new AbortController();
+    const reason = new Error("stop discovery");
+    const acp = client({ requestTimeoutMs: 10_000, env: { PATH: process.env.PATH ?? "", MOCK_DELAY_INITIALIZE_MS: "5000" } });
+    const startedAt = Date.now();
+    const starting = acp.start({ cwd: process.cwd(), signal: controller.signal });
+    setTimeout(() => controller.abort(reason), 10);
+
+    await expect(starting).rejects.toBe(reason);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(acp.isAlive).toBe(false);
+  });
+
+  it("skips graceful ACP close and tears down promptly when aborted after session creation", async () => {
+    const controller = new AbortController();
+    const reason = new Error("stop after session");
+    const acp = client({
+      requestTimeoutMs: 10_000,
+      env: {
+        PATH: process.env.PATH ?? "",
+        MOCK_DELAY_SET_CONFIG_MS: "5000",
+        MOCK_HANG_SESSION_CLOSE: "1",
+      },
+    });
+    const starting = acp.start({ cwd: process.cwd(), model: "Composer 2.5", signal: controller.signal });
+    await waitFor(() => acp.activeSessionId !== undefined);
+
+    const abortedAt = Date.now();
+    controller.abort(reason);
+
+    await expect(starting).rejects.toBe(reason);
+    expect(Date.now() - abortedAt).toBeLessThan(1_000);
+    expect(acp.isAlive).toBe(false);
+  });
 });
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for mock ACP session creation.");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 describe("model option helpers", () => {
   const option = {
@@ -86,6 +134,26 @@ describe("model option helpers", () => {
     expect(resolveCursorModelValue(composer, "Composer 2.5")).toEqual({
       value: "composer-2.5",
       name: "composer-2.5",
+    });
+  });
+
+  it("extracts grouped choices without changing existing resolution semantics", () => {
+    const grouped = {
+      ...option,
+      options: [{
+        group: "premium",
+        name: "Premium",
+        options: [{ value: "composer-2.5", name: "Composer 2.5" }],
+      }],
+    };
+    expect(extractCursorModelChoices(grouped)).toEqual([{
+      value: "composer-2.5",
+      name: "Composer 2.5",
+      group: { id: "premium", name: "Premium" },
+    }]);
+    expect(resolveCursorModelValue(grouped, "Composer 2.5")).toEqual({
+      value: "composer-2.5",
+      name: "Composer 2.5",
     });
   });
 });

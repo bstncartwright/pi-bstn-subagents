@@ -242,6 +242,21 @@ describe("SubagentsServiceAdapter — spawn", () => {
     );
   });
 
+  it("adds camelCase Cursor retry guidance when an explicit Pi model lookup fails", () => {
+    const svc = new SubagentsServiceAdapter(
+      createManagerStub(),
+      () => 'Model not found: "Auto".',
+      makeRuntimeStub(),
+    );
+
+    expect(() => svc.spawn("Explore", "task", { model: "Auto" })).toThrow(
+      /The default Pi backend was searched\. If you intended a Cursor model, call list_subagent_models\(\{ backend: "cursor" \}\)/,
+    );
+    expect(() => svc.spawn("Explore", "task", { model: "Auto" })).toThrow(
+      /backend: "cursor", cursorModel: "<advertised value>".*Omit model, thinkingLevel, and maxTurns/s,
+    );
+  });
+
   it("delegates to manager.spawn with resolved model", () => {
     const resolvedModel = makeModel({ id: "claude-sonnet", provider: "anthropic" });
     const mgr = createManagerStub();
