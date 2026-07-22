@@ -38,7 +38,14 @@ export async function discoverCursorModels(
 
   try {
     throwIfAborted(options.signal);
-    const started = await client.start({ cwd: options.cwd, signal: options.signal });
+    // Model discovery must report ACP's raw catalog/current state. It is not a
+    // subagent execution session, so it intentionally bypasses the runtime's
+    // non-fast default policy.
+    const started = await client.start({
+      cwd: options.cwd,
+      signal: options.signal,
+      applyNonFastDefault: false,
+    });
     throwIfAborted(options.signal);
     const modelOption = findCursorModelOption(started.configOptions);
     if (!modelOption) {

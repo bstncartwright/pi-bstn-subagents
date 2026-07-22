@@ -1,8 +1,12 @@
 import { dirname, join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   CursorAcpClient,
+  cursorModelFastSetting,
+  cursorModelWithFastDisabled,
   extractCursorModelChoices,
   findCursorModelOption,
   resolveCursorModelValue,
@@ -11,12 +15,13 @@ import {
 const mockAgent = join(dirname(fileURLToPath(import.meta.url)), "../fixtures/mock-cursor-acp.mjs");
 
 function client(overrides: ConstructorParameters<typeof CursorAcpClient>[0] = {}) {
+  const { env, ...rest } = overrides;
   return new CursorAcpClient({
     command: process.execPath,
     args: [mockAgent],
     requestTimeoutMs: 5_000,
-    env: { PATH: process.env.PATH ?? "" },
-    ...overrides,
+    env: { PATH: process.env.PATH ?? "", ...env },
+    ...rest,
   });
 }
 
@@ -29,7 +34,7 @@ describe("CursorAcpClient", () => {
       const started = await acp.start({ cwd: process.cwd(), model: "Composer 2.5" });
       expect(started.sessionId).toBe("cursor-session-1");
       expect(started.model).toBe("Composer 2.5");
-		expect(started.modelIdentity).toEqual({ backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5" });
+    expect(started.modelIdentity).toEqual({ backend: "cursor", displayName: "Composer 2.5", value: "composer-2.5[fast=false]" });
       expect(findCursorModelOption(started.configOptions)?.type).toBe("select");
       const result = await acp.prompt("do work");
       expect(result.stopReason).toBe("end_turn");
@@ -63,6 +68,69 @@ describe("CursorAcpClient", () => {
 			await acp.close();
 		}
 	});
+
+  it("defaults an omitted non-Auto fast current model to fast=false", async () => {
+    const acp = client({ env: { MOCK_INITIAL_MODEL: "composer-2.5[fast=true]" } });
+    try {
+      const started = await acp.start({ cwd: process.cwd() });
+      expect(started.modelIdentity).toEqual({
+        backend: "cursor",
+        displayName: "Composer 2.5",
+        value: "composer-2.5[fast=false]",
+      });
+    } finally {
+      await acp.close();
+    }
+  });
+
+  it("defaults an unparameterized model request resolved from a fast choice to fast=false", async () => {
+    const acp = client();
+    try {
+      await expect(acp.start({ cwd: process.cwd(), model: "composer-2.5" }))
+        .resolves.toMatchObject({
+          modelIdentity: { displayName: "Composer 2.5", value: "composer-2.5[fast=false]" },
+        });
+    } finally {
+      await acp.close();
+    }
+  });
+
+  it("keeps explicitly requested fast=true and fast=false values", async () => {
+    const fast = client();
+    const nonFast = client();
+    try {
+      await expect(fast.start({ cwd: process.cwd(), model: "composer-2.5[fast=true]" }))
+        .resolves.toMatchObject({ modelIdentity: { value: "composer-2.5[fast=true]" } });
+      await expect(nonFast.start({ cwd: process.cwd(), model: "composer-2.5[fast=false]" }))
+        .resolves.toMatchObject({
+          modelIdentity: { displayName: "Composer 2.5", value: "composer-2.5[fast=false]" },
+        });
+    } finally {
+      await Promise.all([fast.close(), nonFast.close()]);
+    }
+  });
+
+  it("leaves Auto untouched", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-subagents-acp-"));
+    const log = join(directory, "set-config.log");
+    writeFileSync(log, "");
+    const acp = client({ env: { MOCK_SET_CONFIG_LOG: log } });
+    try {
+      await expect(acp.start({ cwd: process.cwd(), model: "Auto" }))
+        .resolves.toMatchObject({ modelIdentity: { value: "auto" } });
+      expect(readFileSync(log, "utf8")).toBe("");
+    } finally {
+      await acp.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a model update when ACP does not return the exact current value", async () => {
+    const acp = client({ env: { MOCK_RETURN_CONFIG_MODEL: "composer-2.5[fast=true]" } });
+    await expect(acp.start({ cwd: process.cwd(), model: "Composer 2.5" }))
+      .rejects.toThrow(/did not apply model/);
+    expect(acp.isAlive).toBe(false);
+  });
 
   it("uses capability-gated session resume", async () => {
     const acp = client();
@@ -147,6 +215,13 @@ describe("model option helpers", () => {
       value: "composer-2.5",
       name: "composer-2.5",
     });
+  });
+
+  it("reads and changes only Cursor's generic fast parameter", () => {
+    const value = "grok-4.5[effort=high,fast=true]";
+    expect(cursorModelFastSetting(value)).toBe(true);
+    expect(cursorModelWithFastDisabled(value)).toBe("grok-4.5[effort=high,fast=false]");
+    expect(cursorModelWithFastDisabled("auto")).toBeUndefined();
   });
 
   it("extracts grouped choices without changing existing resolution semantics", () => {

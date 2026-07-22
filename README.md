@@ -86,12 +86,14 @@ subagent({
 })
 ```
 
-`cursor_model` is optional. When provided, copy the advertised exact `value` from
-lookup output; browse mode shows Cursor display names only. The extension does
-not maintain a hard-coded Cursor model list. When omitted, Cursor's actual ACP
-current value is captured after session creation and shown as the resolved
-model; the UI never claims a fabricated `default` model while that session is
-still being negotiated.
+`cursor_model` is optional. Cursor execution defaults every non-Auto model with
+an ACP `fast` parameter to `fast=false`: this also applies when the current
+model is inherited or a display-name/unparameterized request resolves to an
+advertised `fast=true` choice. Supplying an exact native value containing
+`fast=true` deliberately opts in; `fast=false` is honored even if ACP only
+advertises the fast sibling. Auto is never changed. Discovery remains raw and
+truthful, so a lookup's advertised `fast=true` value is an explicit fast opt-in,
+not the default execution behavior.
 
 ## UI
 
@@ -226,7 +228,7 @@ All fields are optional — sensible defaults for everything.
 | `display_name`      | —              | Display name for UI (e.g. widget, agent list)                                                                                                                                                                                                                                                                           |
 | `tools`             | all 7          | Comma-separated built-in tools: read, bash, edit, write, grep, find, ls. `none` for no tools                                                                                                                                                                                                                            |
 | `model`             | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`)                                                                                                                                                                                                                                                        |
-| `cursor_model`      | Cursor default | Cursor model name/value advertised by ACP; only valid with `backend: cursor`                                                                                                                                                                                                                                            |
+| `cursor_model`      | Cursor default | Cursor model name/value advertised by ACP; non-Auto fast modes default off unless exact value says `fast=true`; only valid with `backend: cursor`                                                                                                                                                                       |
 | `permission_mode`   | `prompt`       | Cursor ACP permissions: `prompt`, `allow-once`, or `deny`. Automatic mode never chooses an `allow_always` option                                                                                                                                                                                                        |
 | `thinking`          | inherit        | off, minimal, low, medium, high, xhigh                                                                                                                                                                                                                                                                                  |
 | `max_turns`         | unlimited      | Max agentic turns before graceful shutdown. `0` or omit for unlimited                                                                                                                                                                                                                                                   |
@@ -279,7 +281,7 @@ Launch a sub-agent.
 | `subagent_type`     | string       | yes      | Agent type (built-in or custom)                                  |
 | `backend`           | string       | no       | `pi` (default) or `cursor`                                       |
 | `model`             | string       | no       | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`) |
-| `cursor_model`      | string       | no       | Model advertised by Cursor ACP; requires `backend: cursor`       |
+| `cursor_model`      | string       | no       | Cursor model name/value; non-Auto fast modes default off unless exact value says `fast=true`; requires `backend: cursor` |
 | `permission_mode`   | string       | no       | Cursor policy: `prompt`, `allow-once`, or `deny`                 |
 | `thinking`          | string       | no       | Thinking level: off, minimal, low, medium, high, xhigh           |
 | `max_turns`         | number       | no       | Max agentic turns. Omit for unlimited (default)                  |

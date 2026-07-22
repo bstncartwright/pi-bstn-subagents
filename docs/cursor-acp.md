@@ -14,7 +14,9 @@ Each Cursor subagent owns one `agent acp` subprocess and one ACP session:
 4. Create a session, or use `session/resume`/`session/load` only when the
    corresponding capability is advertised.
 5. Inspect the session's advertised configuration options and apply
-   `cursor_model` by standard `model` category, option value, or display name.
+   `cursor_model` by standard `model` category, option value, or display name;
+   non-Auto ACP `fast=true` selections default to the equivalent `fast=false`
+   value unless the caller explicitly supplied `fast=true`.
 6. Send `session/prompt` and normalize message, thought, tool, usage, and
    context updates into the shared subagent state.
 7. On cancellation, send `session/cancel` and continue accepting final updates
@@ -82,10 +84,23 @@ runs in the chosen cwd with the invoking user's permissions.
 
 `cursor_model` is resolved against the configuration returned by the active
 Cursor version. Invalid values fail with the currently advertised choices.
-Omitting it leaves Cursor's current default untouched. If an unfiltered model
-listing cannot reach Cursor, it retains the authenticated Pi list and appends a
-warning; a Cursor-only listing returns that warning. Cancellation propagates
-after session/process cleanup rather than waiting for ACP request timeouts.
+Execution defaults any non-Auto model value with a `fast` parameter to
+`fast=false`: when `cursor_model` is omitted it normalizes a negotiated current
+`fast=true`; a display-name or unparameterized request resolving to an
+advertised `fast=true` choice is normalized too. An exact requested value that
+contains `fast=true` is an explicit opt-in and remains fast; an exact
+`fast=false` value remains non-fast even when ACP did not advertise that
+specific sibling. Auto remains untouched. Every `setConfigOption` response is
+verified against the exact expected `currentValue`; when ACP advertises only the
+fast sibling, the resolved non-fast identity still retains that choice's
+friendly display name alongside its exact value.
+
+This execution policy never changes discovery: `list_subagent_models` opens its
+disposable session with normalization disabled and reports ACP's advertised
+values and current selection verbatim. If an unfiltered model listing cannot
+reach Cursor, it retains the authenticated Pi list and appends a warning; a
+Cursor-only listing returns that warning. Cancellation propagates after
+session/process cleanup rather than waiting for ACP request timeouts.
 
 An explicit `model` value always targets the default Pi backend. When that
 lookup fails and the intended model may be a Cursor display name, the spawn

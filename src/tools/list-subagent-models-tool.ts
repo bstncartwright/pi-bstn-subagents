@@ -129,6 +129,7 @@ export class ListSubagentModelsTool {
       promptGuidelines: [
         "Prefer list_subagent_models({ backend: \"cursor\", query: \"<name>\" }) before spawning; use unfiltered browse only to scan choices.",
         "Reuse a returned exact value for subsequent spawns in the same task instead of rediscovering before every spawn.",
+        "An exact Cursor value containing fast=true explicitly opts into fast mode; omit cursor_model or use a display name for the default non-fast mode.",
         "Do not guess Cursor model values.",
       ],
       description: `Discover models for subagents.
@@ -139,7 +140,7 @@ Prefer lookup over browse:
 
 Pi uses authenticated registry entries (provider/id). Cursor uses one disposable live ACP session. Omit backend to include both. limit defaults to 10 per backend section (max 20).
 
-Reuse returned exact values for later spawns in the same task. Do not include Pi-only model, thinking, or max_turns in Cursor spawns.`,
+Reuse returned exact values for later spawns in the same task. An exact value containing fast=true is an explicit fast opt-in; omit cursor_model or use a display name for the default non-fast mode. Do not include Pi-only model, thinking, or max_turns in Cursor spawns.`,
       parameters: Type.Object({
         backend: Type.Optional(StringEnum(["pi", "cursor"] as const, {
           description: "Optional backend filter. Omit to include both Pi and Cursor.",

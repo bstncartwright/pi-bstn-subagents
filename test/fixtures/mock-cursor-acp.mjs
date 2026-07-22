@@ -1,24 +1,25 @@
 import readline from "node:readline";
+import { appendFileSync } from "node:fs";
 
 const rl = readline.createInterface({ input: process.stdin });
 const sessionId = "cursor-session-1";
-let model = "auto";
+let model = process.env.MOCK_INITIAL_MODEL ?? "auto";
 let pendingPrompt;
 
 function write(message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 }
 
-function configOptions() {
+function configOptions(currentModel = model) {
   return [{
     type: "select",
     id: "cursor-model",
     name: "Model",
     category: "model",
-    currentValue: model,
+    currentValue: currentModel,
     options: [
       { value: "auto", name: "Auto" },
-      { value: "composer-2.5", name: "Composer 2.5" },
+      { value: "composer-2.5[fast=true]", name: "Composer 2.5" },
     ],
   }];
 }
@@ -53,7 +54,11 @@ async function handle(message) {
   }
   if (method === "session/set_config_option") {
     model = params.value;
-    const response = { id, result: { configOptions: configOptions() } };
+    if (process.env.MOCK_SET_CONFIG_LOG) appendFileSync(process.env.MOCK_SET_CONFIG_LOG, `${params.value}\n`);
+    const response = {
+      id,
+      result: { configOptions: configOptions(process.env.MOCK_RETURN_CONFIG_MODEL ?? model) },
+    };
     const delay = Number(process.env.MOCK_DELAY_SET_CONFIG_MS ?? 0);
     if (delay > 0) setTimeout(() => write(response), delay);
     else write(response);

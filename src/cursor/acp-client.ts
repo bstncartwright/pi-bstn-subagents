@@ -33,6 +33,11 @@ export interface CursorAcpStartOptions {
   cwd: string;
   sessionId?: string;
   model?: string;
+  /**
+   * Cursor subagents normally turn off an inherited fast mode. Discovery
+   * disables this so it can report ACP's catalog and current value verbatim.
+   */
+  applyNonFastDefault?: boolean;
   /** Cancels startup requests immediately instead of waiting for their timeout. */
   signal?: AbortSignal;
 }
@@ -116,7 +121,61 @@ export function resolveCursorModelValue(
   const fuzzy = choices.filter(
     (candidate) => fuzzyKey(candidate.value) === key || fuzzyKey(candidate.name) === key,
   );
-  return fuzzy.length === 1 ? { value: fuzzy[0]!.value, name: fuzzy[0]!.name } : undefined;
+  if (fuzzy.length === 1) return { value: fuzzy[0]!.value, name: fuzzy[0]!.name };
+
+  // Cursor does not have to advertise every combination of model parameters.
+  // In particular, a caller may explicitly request fast=false while ACP only
+  // lists the fast=true sibling. Keep the caller's explicit native value, but
+  // borrow the advertised display name when its base model is unambiguous.
+  if (cursorModelFastSetting(requested) !== undefined) {
+    const compatible = choices.filter((candidate) =>
+      cursorModelValueWithoutFast(candidate.value) === cursorModelValueWithoutFast(requested),
+    );
+    if (compatible.length === 1) return { value: requested.trim(), name: compatible[0]!.name };
+  }
+  return undefined;
+}
+
+/** Return Cursor's boolean `fast` parameter when its native value declares one. */
+export function cursorModelFastSetting(value: string): boolean | undefined {
+  for (const parameters of value.matchAll(/\[([^\]]*)\]/g)) {
+    for (const parameter of parameters[1]!.split(",")) {
+      const match = parameter.match(/^\s*fast\s*=\s*(true|false)\s*$/i);
+      if (match) return match[1]!.toLowerCase() === "true";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Return the equivalent ACP value with `fast=false`, without assuming a
+ * particular model family or altering unrelated parameters. Undefined means
+ * the value has no `fast` parameter.
+ */
+export function cursorModelWithFastDisabled(value: string): string | undefined {
+  let found = false;
+  const updated = value.replace(/\[([^\]]*)\]/g, (_bracket, parameters: string) => {
+    const next = parameters.split(",").map((parameter) => {
+      const match = parameter.match(/^(\s*fast\s*=\s*)(true|false)(\s*)$/i);
+      if (!match) return parameter;
+      found = true;
+      return `${match[1]}false${match[3]}`;
+    });
+    return `[${next.join(",")}]`;
+  });
+  return found ? updated : undefined;
+}
+
+/** Whether a choice is Cursor's parameter-less automatic model selector. */
+export function isCursorAutoModel(value: string, displayName?: string): boolean {
+  return value.trim().toLowerCase() === "auto" || displayName?.trim().toLowerCase() === "auto";
+}
+
+function cursorModelValueWithoutFast(value: string): string {
+  return value.replace(/\[([^\]]*)\]/g, (_bracket, parameters: string) => {
+    const retained = parameters.split(",").filter((parameter) => !/^\s*fast\s*=/i.test(parameter));
+    return retained.length > 0 ? `[${retained.join(",")}]` : "";
+  });
 }
 
 /** Read the negotiated model from ACP's final config response. */
@@ -128,9 +187,14 @@ export function cursorModelIdentity(
     return undefined;
   }
   const choice = extractCursorModelChoices(option).find((candidate) => candidate.value === option.currentValue);
+  const equivalentChoice = choice ?? extractCursorModelChoices(option).find((candidate) =>
+    cursorModelValueWithoutFast(candidate.value) === cursorModelValueWithoutFast(option.currentValue),
+  );
   return {
     backend: "cursor",
-    displayName: choice?.name ?? option.currentValue,
+    // ACP may accept fast=false even when it only advertises fast=true. Keep
+    // the friendly advertised identity while retaining the exact current value.
+    displayName: equivalentChoice?.name ?? option.currentValue,
     value: option.currentValue,
   };
 }
@@ -263,17 +327,35 @@ export class CursorAcpClient {
           const available = extractCursorModelChoices(modelOption).map((candidate) => candidate.name).join(", ");
           throw new Error(`Unknown Cursor model ${JSON.stringify(options.model)}. Available: ${available || "none"}.`);
         }
-        const response = await this.request<SetSessionConfigOptionResponse>(acp.methods.agent.session.setConfigOption, {
-          sessionId: this.sessionId,
-          configId: modelOption.id,
-          value: selected.value,
-        }, undefined, options.signal);
-        configOptions = response.configOptions;
-        const applied = findCursorModelOption(configOptions);
-        if (!applied || applied.type !== "select" || applied.currentValue !== selected.value) {
-          throw new Error(`Cursor ACP did not apply model ${JSON.stringify(options.model)}.`);
-        }
+        const requestedFast = cursorModelFastSetting(options.model);
+        const value = requestedFast === true || isCursorAutoModel(selected.value, selected.name)
+          ? selected.value
+          : cursorModelFastSetting(selected.value) === true
+            ? cursorModelWithFastDisabled(selected.value)!
+            : selected.value;
+        configOptions = await this.applyModelValue(
+          modelOption,
+          value,
+          configOptions,
+          options.signal,
+          options.model,
+          isCursorAutoModel(selected.value, selected.name),
+        );
         selectedModel = selected.name;
+      } else if (options.applyNonFastDefault !== false) {
+        const modelOption = findCursorModelOption(configOptions);
+        if (modelOption?.type === "select" && typeof modelOption.currentValue === "string") {
+          const current = modelOption.currentValue;
+          const currentChoice = extractCursorModelChoices(modelOption)
+            .find((candidate) => candidate.value === current);
+          if (
+            !isCursorAutoModel(current, currentChoice?.name)
+            && cursorModelFastSetting(current) === true
+          ) {
+            const value = cursorModelWithFastDisabled(current)!;
+            configOptions = await this.applyModelValue(modelOption, value, configOptions, options.signal, current);
+          }
+        }
       }
 
       return {
@@ -344,6 +426,30 @@ export class CursorAcpClient {
         resolve();
       });
     });
+  }
+
+  /** Apply a native ACP model value and require the returned currentValue to agree exactly. */
+  private async applyModelValue(
+    modelOption: SessionConfigOption,
+    value: string,
+    configOptions: SessionConfigOption[],
+    signal: AbortSignal | undefined,
+    requested: string,
+    skipIfAlreadyCurrent = false,
+  ): Promise<SessionConfigOption[]> {
+    if (skipIfAlreadyCurrent && modelOption.type === "select" && modelOption.currentValue === value) {
+      return configOptions;
+    }
+    const response = await this.request<SetSessionConfigOptionResponse>(acp.methods.agent.session.setConfigOption, {
+      sessionId: this.sessionId,
+      configId: modelOption.id,
+      value,
+    }, undefined, signal);
+    const applied = findCursorModelOption(response.configOptions);
+    if (!applied || applied.type !== "select" || applied.currentValue !== value) {
+      throw new Error(`Cursor ACP did not apply model ${JSON.stringify(requested)}.`);
+    }
+    return response.configOptions;
   }
 
   private async request<T = unknown>(

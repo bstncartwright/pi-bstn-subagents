@@ -35,8 +35,33 @@ describe("discoverCursorModels", () => {
       { value: "auto", name: "Auto", current: true, group: { id: "recommended", name: "Recommended" } },
       { value: "composer-2.5", name: "Composer 2.5", current: false, group: { id: "recommended", name: "Recommended" } },
     ]);
-    expect(client.start).toHaveBeenCalledWith({ cwd: "/project", signal: controller.signal });
+    expect(client.start).toHaveBeenCalledWith({
+      cwd: "/project",
+      signal: controller.signal,
+      applyNonFastDefault: false,
+    });
     expect(client.close).toHaveBeenCalledWith({ graceful: true });
+  });
+
+  it("disables the execution-only non-fast default so discovery stays truthful", async () => {
+    const currentFast = {
+      ...started,
+      configOptions: [{
+        ...started.configOptions[0]!,
+        currentValue: "composer-2.5[fast=true]",
+        options: [{ value: "composer-2.5[fast=true]", name: "Composer 2.5" }],
+      }],
+    };
+    const client = { start: vi.fn().mockResolvedValue(currentFast), close: vi.fn() };
+
+    await expect(discoverCursorModels({ cwd: "/project", createClient: () => client })).resolves.toEqual([
+      { value: "composer-2.5[fast=true]", name: "Composer 2.5", current: true },
+    ]);
+    expect(client.start).toHaveBeenCalledWith({
+      cwd: "/project",
+      signal: undefined,
+      applyNonFastDefault: false,
+    });
   });
 
   it("propagates abort after closing the disposable client", async () => {
